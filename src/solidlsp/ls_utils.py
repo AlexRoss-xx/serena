@@ -176,12 +176,30 @@ class FileUtils:
         """
         Reads the file at the given path using the given encoding and returns the contents as a string.
         If decoding fails, tries to detect the encoding using charset_normalizer.
+        
+        Skips binary files (detected by presence of null bytes in first 8KB).
 
         Raises FileNotFoundError if the file does not exist.
         """
         if not os.path.exists(file_path):
             log.error(f"Failed to read '{file_path}': File does not exist.")
             raise FileNotFoundError(f"File read '{file_path}' failed: File does not exist.")
+        
+        # Check if file is binary by reading first chunk
+        try:
+            with open(file_path, 'rb') as f:
+                chunk = f.read(8192)  # Read first 8KB
+                # Binary files often contain null bytes
+                if b'\x00' in chunk:
+                    log.warning(f"Skipping binary file '{file_path}'")
+                    raise UnicodeDecodeError('binary', b'', 0, 1, 'Binary file detected')
+        except Exception as exc:
+            if not isinstance(exc, UnicodeDecodeError):
+                log.error(f"Failed to check if '{file_path}' is binary: {exc}")
+                raise exc
+            # If it's a UnicodeDecodeError for binary detection, re-raise it
+            raise exc
+            
         try:
             try:
                 with open(file_path, encoding=encoding) as inp_file:
@@ -190,11 +208,16 @@ class FileUtils:
                 results = charset_normalizer.from_path(file_path)
                 match = results.best()
                 if match:
-                    log.warning(
+                    log.debug(
                         f"Could not decode {file_path} with encoding='{encoding}'; using best match '{match.encoding}' instead",
                     )
                     return match.raw.decode(match.encoding)
-                raise ude
+                
+                # Fallback to latin-1 if no match found or match failed
+                # latin-1 maps all 256 bytes to unicode code points, so it never fails to decode
+                log.warning(f"Could not detect encoding for {file_path}; falling back to 'latin-1'")
+                with open(file_path, 'r', encoding='latin-1') as f:
+                    return f.read()
         except Exception as exc:
             log.error(f"Failed to read '{file_path}' with encoding '{encoding}': {exc}")
             raise exc

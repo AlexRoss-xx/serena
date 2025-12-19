@@ -11,7 +11,7 @@ from serena.config.serena_config import DEFAULT_TOOL_TIMEOUT, ProjectConfig, get
 from serena.constants import SERENA_FILE_ENCODING, SERENA_MANAGED_DIR_NAME
 from serena.ls_manager import LanguageServerFactory, LanguageServerManager
 from serena.text_utils import MatchedConsecutiveLines, search_files
-from serena.util.file_system import GitignoreParser, match_path
+from serena.util.file_system import GitignoreParser, match_path, to_long_path
 from serena.util.general import save_yaml
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
@@ -181,11 +181,15 @@ class Project(ToStringMixin):
             return False
 
         abs_path = os.path.join(self.project_root, relative_path)
-        if not os.path.exists(abs_path):
+        
+        # Use long path prefix on Windows to avoid MAX_PATH issues
+        check_path = to_long_path(abs_path)
+        
+        if not os.path.exists(check_path):
             raise FileNotFoundError(f"File {abs_path} not found, the ignore check cannot be performed")
 
         # Check file extension if it's a file
-        is_file = os.path.isfile(abs_path)
+        is_file = os.path.isfile(check_path)
         if is_file and ignore_non_source_files:
             is_file_in_supported_language = False
             for language in self.project_config.languages:

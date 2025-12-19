@@ -64,6 +64,7 @@ class Language(str, Enum):
     GROOVY = "groovy"
     VUE = "vue"
     POWERSHELL = "powershell"
+    PASCAL = "pascal"
     # Experimental or deprecated Language Servers
     TYPESCRIPT_VTS = "typescript_vts"
     """Use the typescript language server through the natively bundled vscode extension via https://github.com/yioneko/vtsls"""
@@ -162,6 +163,9 @@ class Language(str, Enum):
                 return FilenameMatcher("*.rb")
             case self.CPP:
                 return FilenameMatcher("*.cpp", "*.h", "*.hpp", "*.c", "*.hxx", "*.cc", "*.cxx")
+            case self.PASCAL:
+                # Pascal / Object Pascal / Delphi-style units & programs
+                return FilenameMatcher("*.pas", "*.pp", "*.lpr", "*.dpr", "*.dfm")
             case self.KOTLIN:
                 return FilenameMatcher("*.kt", "*.kts")
             case self.DART:
@@ -172,6 +176,7 @@ class Language(str, Enum):
                 return FilenameMatcher("*.R", "*.r", "*.Rmd", "*.Rnw")
             case self.PERL:
                 return FilenameMatcher("*.pl", "*.pm", "*.t")
+              
             case self.CLOJURE:
                 return FilenameMatcher("*.clj", "*.cljs", "*.cljc", "*.edn")  # codespell:ignore edn
             case self.ELIXIR:
@@ -252,8 +257,12 @@ class Language(str, Enum):
                 return RustAnalyzer
             case self.CSHARP:
                 from solidlsp.language_servers.csharp_language_server import CSharpLanguageServer
-
+            
                 return CSharpLanguageServer
+            case self.PASCAL:
+                from solidlsp.language_servers.pascal_language_server import PascalLanguageServer
+                return PascalLanguageServer
+
             case self.CSHARP_OMNISHARP:
                 from solidlsp.language_servers.omnisharp import OmniSharp
 

@@ -19,6 +19,19 @@ class ScanResult(NamedTuple):
     files: list[str]
 
 
+
+def to_long_path(path: str) -> str:
+    """
+    Convert a path to a Windows long path (UNC) if necessary.
+    This allows accessing paths longer than 260 characters on Windows.
+    """
+    if os.name == "nt" and not path.startswith("\\\\?\\"):
+        # Only add prefix if it's an absolute path or we make it absolute
+        abs_path = os.path.abspath(path)
+        return "\\\\?\\" + abs_path
+    return path
+
+
 def scan_directory(
     path: str,
     recursive: bool = False,
