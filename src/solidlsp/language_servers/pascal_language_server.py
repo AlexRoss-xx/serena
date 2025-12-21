@@ -66,72 +66,62 @@ class PascalLanguageServer(SolidLanguageServer):
     def is_ignored_dirname(self, dirname: str) -> bool:
         """Extend default ignored directories with Pascal-specific build folders."""
         return super().is_ignored_dirname(dirname) or dirname.lower() in {
-            "lib", "backup", "bak", "tmp",
+            "lib", "backup", "bak", "tmp", "__history",
         }
 
-    @classmethod
-    def _locate_pasls_executable(cls) -> str:
-        """Find the pasls executable using env var, PATH, and common local build paths."""
-        exe_name = "pasls.exe" if os.name == "nt" else "pasls"
+    def _scan_for_source_dirs(self, root_path: str) -> set[str]:
+        """
+        Recursively find all directories containing Pascal source files (.pas, .pp, .inc).
+        """
+        valid_extensions = {".pas", ".pp", ".inc"}
+        source_dirs = set()
 
-        # 1. Explicit path from environment variable
-        env_path = os.environ.get(_PASLS_ENV_VAR)
-        if env_path:
-            expanded = os.path.expanduser(env_path)
-            if os.path.isfile(expanded):
-                log.info(f"Using pasls from {_PASLS_ENV_VAR}={expanded}")
-                return expanded
-            log.warning(f"{_PASLS_ENV_VAR} is set but file not found: {expanded}")
+        for root, dirs, files in os.walk(root_path):
+            # Prune ignored directories in-place
+            dirs[:] = [d for d in dirs if not self.is_ignored_dirname(d)]
 
-        # 2. Search on PATH
-        from_path = shutil.which(exe_name)
-        if from_path:
-            log.info(f"Found pasls executable on PATH at {from_path}")
-            return from_path
+            # Check if this directory contains any valid source files
+            has_source = any(os.path.splitext(f)[1].lower() in valid_extensions for f in files)
+            if has_source:
+                source_dirs.add(root)
 
-        # 3. Look for a sibling pascal-language-server-genericptr checkout
-        try:
-            repo_root = pathlib.Path(__file__).resolve().parents[4]
-        except IndexError:
-            repo_root = pathlib.Path(__file__).resolve().parent
+        return source_dirs
 
-        pls_root = repo_root / "pascal-language-server-genericptr"
-        lib_root = pls_root / "lib"
-        
-        candidates: list[pathlib.Path] = []
-        if lib_root.is_dir():
-            for arch_dir in lib_root.iterdir():
-                if arch_dir.is_dir():
-                    candidates.append(arch_dir / exe_name)
-
-        for candidate in candidates:
-            if candidate.is_file():
-                log.info(f"Found pasls in local checkout at {candidate}")
-                return str(candidate)
-
-        # Nothing found
-        message = (
-            "Pascal language server executable 'pasls' was not found.\\n\\n"
-            "Make sure you have built pasls and either:\\n"
-            f"  * add it to your PATH, or\\n"
-            f"  * set {_PASLS_ENV_VAR} to the full path of pasls.exe\\n"
-        )
-        log.error(message)
-        raise RuntimeError(message)
-
-    @staticmethod
-    def _get_initialize_params(repository_absolute_path: str) -> InitializeParams:
-        """Build LSP initialize parameters for pasls."""
+    def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
+        """Build LSP initialize parameters for pasls with dynamic include paths."""
         root_uri = pathlib.Path(repository_absolute_path).as_uri()
         # Hack for enhanced pasls on Windows: remove one slash if it starts with file:///
-        # This is because the Pascal URIParser implementation on Windows seems to misinterpret
-        # file:///D:/... as /D:/... (treating the first slash as root).
-        # Sending file://D:/... seems to help it parse correctly as D:/...
         if os.name == 'nt' and root_uri.startswith('file:///'):
             root_uri = root_uri.replace('file:///', 'file://')
 
+        # Dynamically scan for source directories to set as search paths
+        # This avoids the need for manual configuration files like .fp-params
+        source_dirs = self._scan_for_source_dirs(repository_absolute_path)
+        
+        fpc_options = ["-Mdelphi"]
+        for src_dir in source_dirs:
+            # Add as unit path (-Fu) and include path (-Fi)
+            # We use absolute paths to be safe
+            fpc_options.append(f"-Fu{src_dir}")
+            fpc_options.append(f"-Fi{src_dir}")
+
+        # Add explicit support for 'Common' if it exists directly in root, just to be sure
+        common_path = os.path.join(repository_absolute_path, "Common")
+        if os.path.isdir(common_path) and common_path not in source_dirs:
+             fpc_options.append(f"-Fu{common_path}")
+             fpc_options.append(f"-Fi{common_path}")
+
+        log.info(f"Auto-configured {len(source_dirs)} Pascal source directories for project {os.path.basename(repository_absolute_path)}")
+
         initialize_params: InitializeParams = {
             "locale": "en",
+            "initializationOptions": {
+                # Inject the discovered paths as Free Pascal Compiler options
+                "fpcOptions": fpc_options,
+                # Ensure the LS knows we want it to parse the program
+                "program": "", 
+                "symbolDatabase": "",
+            },
             "capabilities": {
                 "textDocument": {
                     "synchronization": {"didSave": True, "dynamicRegistration": True},
@@ -173,6 +163,63 @@ class PascalLanguageServer(SolidLanguageServer):
         }
 
         return initialize_params
+
+    @classmethod
+    def _locate_pasls_executable(cls) -> str:
+        """Find the pasls executable using env var, PATH, and common local build paths."""
+        exe_name = "pasls.exe" if os.name == "nt" else "pasls"
+
+        # 1. Explicit path from environment variable
+        env_path = os.environ.get(_PASLS_ENV_VAR)
+        if env_path:
+            expanded = os.path.expanduser(env_path)
+            if os.path.isfile(expanded):
+                log.info(f"Using pasls from {_PASLS_ENV_VAR}={expanded}")
+                return expanded
+            log.warning(f"{_PASLS_ENV_VAR} is set but file not found: {expanded}")
+
+        # 2. Search on PATH
+        from_path = shutil.which(exe_name)
+        if from_path:
+            log.info(f"Found pasls executable on PATH at {from_path}")
+            return from_path
+
+        # 3. Look for a sibling or nested pascal-language-server-genericptr checkout
+        try:
+            repo_root = pathlib.Path(__file__).resolve().parents[4]
+        except IndexError:
+            repo_root = pathlib.Path(__file__).resolve().parent
+
+        # Candidates for the base of the genericptr repo
+        search_roots = [
+            repo_root / "pascal-language-server-genericptr",
+            repo_root / "Intrahealth" / "SERENA" / "pascal-language-server-genericptr",
+        ]
+
+        candidates: list[pathlib.Path] = []
+        
+        for pls_root in search_roots:
+            lib_root = pls_root / "lib"
+            if lib_root.is_dir():
+                for arch_dir in lib_root.iterdir():
+                    if arch_dir.is_dir():
+                        candidates.append(arch_dir / exe_name)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                log.info(f"Found pasls in local checkout at {candidate}")
+                return str(candidate)
+
+        # Nothing found
+        message = (
+            "Pascal language server executable 'pasls' was not found.\\n\\n"
+            "Make sure you have built pasls and either:\\n"
+            f"  * add it to your PATH, or\\n"
+            f"  * set {_PASLS_ENV_VAR} to the full path of pasls.exe\\n"
+        )
+        log.error(message)
+        raise RuntimeError(message)
+
 
     def _start_server(self) -> None:
         """Start pasls, send initialize, and mark the server as ready."""

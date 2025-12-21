@@ -186,19 +186,19 @@ class FileUtils:
             raise FileNotFoundError(f"File read '{file_path}' failed: File does not exist.")
         
         # Check if file is binary by reading first chunk
-        try:
-            with open(file_path, 'rb') as f:
-                chunk = f.read(8192)  # Read first 8KB
-                # Binary files often contain null bytes
-                if b'\x00' in chunk:
-                    log.warning(f"Skipping binary file '{file_path}'")
-                    raise UnicodeDecodeError('binary', b'', 0, 1, 'Binary file detected')
-        except Exception as exc:
-            if not isinstance(exc, UnicodeDecodeError):
-                log.error(f"Failed to check if '{file_path}' is binary: {exc}")
-                raise exc
-            # If it's a UnicodeDecodeError for binary detection, re-raise it
-            raise exc
+        # try:
+        #     with open(file_path, 'rb') as f:
+        #         chunk = f.read(8192)  # Read first 8KB
+        #         # Binary files often contain null bytes
+        #         if b'\x00' in chunk:
+        #             log.warning(f"Skipping binary file '{file_path}'")
+        #             raise UnicodeDecodeError('binary', b'', 0, 1, 'Binary file detected')
+        # except Exception as exc:
+        #     if not isinstance(exc, UnicodeDecodeError):
+        #         log.error(f"Failed to check if '{file_path}' is binary: {exc}")
+        #         raise exc
+        #     # If it's a UnicodeDecodeError for binary detection, re-raise it
+        #     raise exc
             
         try:
             try:

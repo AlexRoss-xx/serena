@@ -186,7 +186,7 @@ class Project(ToStringMixin):
         check_path = to_long_path(abs_path)
         
         if not os.path.exists(check_path):
-            raise FileNotFoundError(f"File {abs_path} not found, the ignore check cannot be performed")
+            return True
 
         # Check file extension if it's a file
         is_file = os.path.isfile(check_path)

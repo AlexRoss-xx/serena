@@ -369,7 +369,7 @@ class SolidLanguageServer(ABC):
         """
         abs_path = os.path.join(self.repository_root_path, relative_path)
         if not os.path.exists(abs_path):
-            raise FileNotFoundError(f"File {abs_path} not found, the ignore check cannot be performed")
+            return True
 
         # Check file extension if it's a file
         is_file = os.path.isfile(abs_path)
