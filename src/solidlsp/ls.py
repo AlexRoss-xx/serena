@@ -474,6 +474,14 @@ class SolidLanguageServer(ABC):
         """
         return self.language_id
 
+    def _path_to_uri(self, absolute_file_path: str) -> str:
+        """
+        Convert an absolute file path to a file URI.
+
+        Subclasses may override this for language-server-specific URI quirks.
+        """
+        return PathUtils.path_to_uri(absolute_file_path)
+
     @contextmanager
     def open_file(self, relative_file_path: str) -> Iterator[LSPFileBuffer]:
         """
@@ -486,7 +494,7 @@ class SolidLanguageServer(ABC):
             raise SolidLSPException("Language Server not started")
 
         absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
-        uri = pathlib.Path(absolute_file_path).as_uri()
+        uri = self._path_to_uri(absolute_file_path)
 
         if uri in self.open_file_buffers:
             assert self.open_file_buffers[uri].uri == uri
@@ -963,9 +971,7 @@ class SolidLanguageServer(ABC):
 
             # no cached result, query language server
             log.debug(f"Requesting document symbols for {relative_file_path} from the Language Server")
-            response = self.server.send.document_symbol(
-                {"textDocument": {"uri": pathlib.Path(os.path.join(self.repository_root_path, relative_file_path)).as_uri()}}
-            )
+            response = self.server.send.document_symbol({"textDocument": {"uri": fd.uri}})
 
             # update cache
             self._raw_document_symbols_cache[cache_key] = (fd.content_hash, response)

@@ -228,11 +228,11 @@ class TopLevelCommands(AutoRegisteringGroup):
 
         log.info("Initializing Serena MCP server")
         log.info("Storing logs in %s", log_path)
+        log.info("Serena CLI source: %s", Path(__file__).resolve())
 
         if sys.platform == "win32":
             # Enforce UTF-8 for stdio to ensure correct handling of JSON-RPC over pipes,
             # especially when special characters are involved.
-            import os
 
             # Use reconfigure if available (Python 3.7+)
             if hasattr(sys.stdin, "reconfigure"):
@@ -245,21 +245,21 @@ class TopLevelCommands(AutoRegisteringGroup):
             # This is necessary because mcp creates its own TextIOWrapper around .buffer without newline=""
             try:
                 import io
+
                 import mcp.server.stdio
 
                 log.info("Monkeypatching mcp.server.stdio.TextIOWrapper to disable newline translation")
 
                 class FastMCPTextIOWrapper(io.TextIOWrapper):
-                    def __init__(self, *args, **kwargs):
+                    def __init__(self, *args: Any, **kwargs: Any) -> None:
                         if "newline" not in kwargs:
                             # Force no newline translation
                             kwargs["newline"] = ""
                         super().__init__(*args, **kwargs)
 
-                mcp.server.stdio.TextIOWrapper = FastMCPTextIOWrapper
+                mcp.server.stdio.TextIOWrapper = FastMCPTextIOWrapper  # type: ignore[misc,assignment]
             except ImportError:
                 log.warning("Could not monkeypatch mcp.server.stdio (module not found?)")
-
 
         # Handle --project-from-cwd flag
         if project_from_cwd:

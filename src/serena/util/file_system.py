@@ -19,7 +19,6 @@ class ScanResult(NamedTuple):
     files: list[str]
 
 
-
 def to_long_path(path: str) -> str:
     """
     Convert a path to a Windows long path (UNC) if necessary.

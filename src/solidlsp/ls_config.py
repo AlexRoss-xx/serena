@@ -176,7 +176,7 @@ class Language(str, Enum):
                 return FilenameMatcher("*.R", "*.r", "*.Rmd", "*.Rnw")
             case self.PERL:
                 return FilenameMatcher("*.pl", "*.pm", "*.t")
-              
+
             case self.CLOJURE:
                 return FilenameMatcher("*.clj", "*.cljs", "*.cljc", "*.edn")  # codespell:ignore edn
             case self.ELIXIR:
@@ -257,10 +257,11 @@ class Language(str, Enum):
                 return RustAnalyzer
             case self.CSHARP:
                 from solidlsp.language_servers.csharp_language_server import CSharpLanguageServer
-            
+
                 return CSharpLanguageServer
             case self.PASCAL:
                 from solidlsp.language_servers.pascal_language_server import PascalLanguageServer
+
                 return PascalLanguageServer
 
             case self.CSHARP_OMNISHARP:

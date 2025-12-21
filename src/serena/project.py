@@ -181,10 +181,10 @@ class Project(ToStringMixin):
             return False
 
         abs_path = os.path.join(self.project_root, relative_path)
-        
+
         # Use long path prefix on Windows to avoid MAX_PATH issues
         check_path = to_long_path(abs_path)
-        
+
         if not os.path.exists(check_path):
             return True
 

@@ -7,7 +7,7 @@ import os
 import pathlib
 import shutil
 import threading
-from typing import Final
+from typing import Any, Final, cast
 
 from overrides import override
 
@@ -38,7 +38,7 @@ class PascalLanguageServer(SolidLanguageServer):
          - <serena-root>/pascal-language-server-genericptr/lib/*/pasls(.exe)
 
     If nothing is found, an informative RuntimeError is raised.
-    
+
     Note: The enhanced fork uses InitWithEnvironmentVariables() to find FPC from PATH.
     Make sure Free Pascal Compiler is in your system PATH.
     """
@@ -70,20 +70,88 @@ class PascalLanguageServer(SolidLanguageServer):
 
         self.server_ready = threading.Event()
         self.request_id = 0
+        if os.name == "nt":
+            log.info("Pascal LS Windows URI workaround enabled (file:/// -> file://)")
 
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
-        """Extend default ignored directories with Pascal-specific build folders."""
-        return super().is_ignored_dirname(dirname) or dirname.lower() in {
-            "lib", "backup", "bak", "tmp", "__history",
+        """Extend default ignored directories with Pascal-specific build folders.
+
+        This method filters out:
+        - Common Pascal build/backup directories
+        - Known large external library directory names
+
+        NOTE: We deliberately do NOT exclude generic names like 'tools', 'test', 'components'
+        because these are often valid source directories in user Delphi projects.
+        Only exclude directories that are clearly build artifacts or known external libraries.
+        """
+        dirname_lower = dirname.lower()
+
+        # Standard Pascal build/backup directories - these NEVER contain source code
+        pascal_build_dirs = {
+            "lib",
+            "backup",
+            "bak",
+            "tmp",
+            "__history",
+            "output",
+            "bin",
+            "obj",
+            "__recovery",
+            "dcu",
+            "exe",
+            "debug",
+            "release",
         }
+
+        # Known large external/third-party directory names that typically contain
+        # full copies of external libraries that should be excluded
+        external_library_dirs = {
+            # Lazarus IDE / FPC complete source trees
+            "lazarus-trunk",
+            "lazarus",
+            "fpc",
+            "freepascal",
+            # macOS app bundles (not source code)
+            "lazarus.app",
+            "startlazarus.app",
+            # Common third-party lib root directories (when included as full copies)
+            "synapse",
+            "indy",
+            "jedi",
+            "jcl",
+            "jvcl",
+        }
+
+        all_ignored = pascal_build_dirs | external_library_dirs
+
+        return super().is_ignored_dirname(dirname) or dirname_lower in all_ignored
+
+    @override
+    def _path_to_uri(self, absolute_file_path: str) -> str:
+        """
+        Pasls (genericptr / CGE fork) on Windows expects file URIs in the form `file://D:/...`
+        (two slashes) and may return `null` for requests when given the standard `file:///D:/...`.
+        """
+        uri = super()._path_to_uri(absolute_file_path)
+        if os.name == "nt" and uri.startswith("file:///"):
+            return uri.replace("file:///", "file://", 1)
+        return uri
 
     def _scan_for_source_dirs(self, root_path: str) -> set[str]:
         """
         Recursively find all directories containing Pascal source files (.pas, .pp, .inc).
+
+        Returns a set of absolute directory paths that should be added as -Fu and -Fi paths.
+        Limits the number of directories to prevent overwhelming the compiler with too many paths.
+
+        This method specifically handles Delphi-style project structures where:
+        - Include files (.inc) may be in parent directories
+        - Units (.pas) may reference units from sibling directory trees
         """
         valid_extensions = {".pas", ".pp", ".inc"}
-        source_dirs = set()
+        source_dirs: set[str] = set()
+        max_dirs = 1000  # Increased limit for large Delphi projects like Profile
 
         for root, dirs, files in os.walk(root_path):
             # Prune ignored directories in-place
@@ -94,41 +162,58 @@ class PascalLanguageServer(SolidLanguageServer):
             if has_source:
                 source_dirs.add(root)
 
+            # Stop if we've hit the limit
+            if len(source_dirs) >= max_dirs:
+                log.warning(
+                    f"Pascal source directory scan hit limit of {max_dirs} directories. "
+                    "Some directories may be excluded. Consider adding large external libraries "
+                    "to ignored_paths in .serena/project.yml"
+                )
+                break
+
+        if source_dirs:
+            log.info(f"Found {len(source_dirs)} Pascal source directories in {os.path.basename(root_path)}")
+            # Log first few directories for debugging (helpful for verifying paths are found)
+            sample_dirs = sorted(source_dirs)[:5]
+            for d in sample_dirs:
+                log.debug(f"  Sample source dir: {d}")
+
         return source_dirs
 
     def _get_initialize_params(self, repository_absolute_path: str) -> InitializeParams:
         """Build LSP initialize parameters for pasls with dynamic include paths."""
         root_uri = pathlib.Path(repository_absolute_path).as_uri()
         # Hack for enhanced pasls on Windows: remove one slash if it starts with file:///
-        if os.name == 'nt' and root_uri.startswith('file:///'):
-            root_uri = root_uri.replace('file:///', 'file://')
+        if os.name == "nt" and root_uri.startswith("file:///"):
+            root_uri = root_uri.replace("file:///", "file://")
 
         # Dynamically scan for source directories to set as search paths
         # This avoids the need for manual configuration files like .fp-params
         source_dirs = self._scan_for_source_dirs(repository_absolute_path)
-        
+
+        # Start with Delphi compatibility mode
         fpc_options = ["-Mdelphi"]
-        for src_dir in source_dirs:
+
+        # Add all discovered source directories as unit and include paths
+        for src_dir in sorted(source_dirs):  # Sort for consistent ordering
             # Add as unit path (-Fu) and include path (-Fi)
             # We use absolute paths to be safe
             fpc_options.append(f"-Fu{src_dir}")
             fpc_options.append(f"-Fi{src_dir}")
 
-        # Add explicit support for 'Common' if it exists directly in root, just to be sure
-        common_path = os.path.join(repository_absolute_path, "Common")
-        if os.path.isdir(common_path) and common_path not in source_dirs:
-             fpc_options.append(f"-Fu{common_path}")
-             fpc_options.append(f"-Fi{common_path}")
+        log.info(f"Pascal LSP configured for {os.path.basename(repository_absolute_path)} with {len(source_dirs)} source directories")
 
-        log.info(f"Auto-configured {len(source_dirs)} Pascal source directories for project {os.path.basename(repository_absolute_path)}")
+        # Log the fpcOptions at debug level for troubleshooting
+        if source_dirs:
+            log.debug(f"fpcOptions count: {len(fpc_options)}")
 
-        initialize_params: InitializeParams = {
+        initialize_params: dict[str, Any] = {
             "locale": "en",
             "initializationOptions": {
                 # Inject the discovered paths as Free Pascal Compiler options
                 "fpcOptions": fpc_options,
                 # Ensure the LS knows we want it to parse the program
-                "program": "", 
+                "program": "",
                 "symbolDatabase": "",
             },
             "capabilities": {
@@ -171,18 +256,33 @@ class PascalLanguageServer(SolidLanguageServer):
             ],
         }
 
-        return initialize_params
+        return cast(InitializeParams, initialize_params)
 
     @classmethod
     def _locate_pasls_executable(cls) -> str:
         """Find the pasls executable using env var, PATH, and common local build paths."""
         exe_name = "pasls.exe" if os.name == "nt" else "pasls"
+        patched_exe_name = "pasls_patched.exe" if os.name == "nt" else "pasls_patched"
 
         # 1. Explicit path from environment variable
         env_path = os.environ.get(_PASLS_ENV_VAR)
         if env_path:
             expanded = os.path.expanduser(env_path)
             if os.path.isfile(expanded):
+                # If a patched build exists alongside the configured pasls, prefer it.
+                # This avoids locking issues when replacing the original binary and lets us
+                # ship hotfixes without changing user environment variables.
+                expanded_path = pathlib.Path(expanded)
+                patched_candidates = [
+                    expanded_path.with_name(patched_exe_name),
+                    # Common layout: <repo>/lib/<arch>/pasls.exe, patched at <repo>/pasls_patched.exe
+                    expanded_path.parents[2] / patched_exe_name if len(expanded_path.parents) >= 3 else None,
+                ]
+                for candidate in patched_candidates:
+                    if candidate is not None and candidate.is_file():
+                        log.info(f"Using patched pasls at {candidate} (preferred over {_PASLS_ENV_VAR}={expanded})")
+                        return str(candidate)
+
                 log.info(f"Using pasls from {_PASLS_ENV_VAR}={expanded}")
                 return expanded
             log.warning(f"{_PASLS_ENV_VAR} is set but file not found: {expanded}")
@@ -206,13 +306,15 @@ class PascalLanguageServer(SolidLanguageServer):
         ]
 
         candidates: list[pathlib.Path] = []
-        
+
         for pls_root in search_roots:
             lib_root = pls_root / "lib"
             if lib_root.is_dir():
                 for arch_dir in lib_root.iterdir():
                     if arch_dir.is_dir():
                         candidates.append(arch_dir / exe_name)
+            # also allow a patched executable at the repo root
+            candidates.append(pls_root / patched_exe_name)
 
         for candidate in candidates:
             if candidate.is_file():
@@ -229,18 +331,17 @@ class PascalLanguageServer(SolidLanguageServer):
         log.error(message)
         raise RuntimeError(message)
 
-
     def _start_server(self) -> None:
         """Start pasls, send initialize, and mark the server as ready."""
 
-        def register_capability_handler(params):
-            return
+        def register_capability_handler(params: Any) -> None:
+            return None
 
-        def window_log_message(msg):
+        def window_log_message(msg: Any) -> None:
             log.info(f"LSP (pasls) window/logMessage: {msg}")
 
-        def do_nothing(_params):
-            return
+        def do_nothing(_params: Any) -> None:
+            return None
 
         self.server.on_request("client/registerCapability", register_capability_handler)
         self.server.on_notification("window/logMessage", window_log_message)
