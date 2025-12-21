@@ -51,10 +51,19 @@ class PascalLanguageServer(SolidLanguageServer):
     ):
         pasls_path = self._locate_pasls_executable()
 
+        # Support explicitly setting the path to FPC (compiler) via SERENA_FPC_PATH
+        # This allows users to enforce a specific compiler version, which is critical for parsing
+        env = os.environ.copy()
+        fpc_path = os.environ.get("SERENA_FPC_PATH")
+        if fpc_path:
+            # Prepend to PATH so it takes precedence over system installed versions
+            env["PATH"] = fpc_path + os.pathsep + env.get("PATH", "")
+            log.info(f"Using explicitly configured FPC path: {fpc_path}")
+
         super().__init__(
             config,
             repository_root_path,
-            ProcessLaunchInfo(cmd=pasls_path, cwd=repository_root_path),
+            ProcessLaunchInfo(cmd=pasls_path, cwd=repository_root_path, env=env),
             "pascal",
             solidlsp_settings,
         )
