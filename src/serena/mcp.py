@@ -2,6 +2,7 @@
 The Serena Model Context Protocol (MCP) Server
 """
 
+import os
 import sys
 from abc import abstractmethod
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -258,6 +259,7 @@ class SerenaMCPFactory:
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = None,
         trace_lsp_communication: bool | None = None,
         tool_timeout: float | None = None,
+        ls_startup_timeout: str | None = None,
     ) -> FastMCP:
         """
         Create an MCP server with process-isolated SerenaAgent to prevent asyncio contamination.
@@ -273,6 +275,7 @@ class SerenaMCPFactory:
         :param trace_lsp_communication: Whether to trace the communication between Serena and the language servers.
             This is useful for debugging language server issues.
         :param tool_timeout: Timeout in seconds for tool execution. If not specified, will take the value from the serena configuration.
+        :param ls_startup_timeout: Override startup timeout for language servers. Use "none" to disable startup timeout.
         """
         try:
             config = SerenaConfig.from_config_file()
@@ -289,6 +292,9 @@ class SerenaMCPFactory:
                 config.trace_lsp_communication = trace_lsp_communication
             if tool_timeout is not None:
                 config.tool_timeout = tool_timeout
+            if ls_startup_timeout is not None:
+                # plumb via environment variable used by SerenaAgent.reset_language_server_manager
+                os.environ["SERENA_LS_STARTUP_TIMEOUT"] = ls_startup_timeout
             if language_backend is not None:
                 config.language_backend = language_backend
 

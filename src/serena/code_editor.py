@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
 
 from serena.symbol import JetBrainsSymbol, LanguageServerSymbol, LanguageServerSymbolRetriever, PositionInFile, Symbol
 from solidlsp import SolidLanguageServer, ls_types
+from solidlsp.ls_config import Language
 from solidlsp.ls import LSPFileBuffer
 from solidlsp.ls_utils import PathUtils, TextUtils
 
@@ -347,6 +348,26 @@ class LanguageServerCodeEditor(CodeEditor[LanguageServerSymbol]):
         assert symbol.location.column is not None
 
         lang_server = self._get_language_server(relative_file_path)
+
+        # Robustness: pasls is known to crash on some workspace-wide operations (native "Access violation"),
+        # including textDocument/rename in large codebases. Keep rename disabled by default for Pascal.
+        if lang_server.language == Language.PASCAL:
+            enable_rename = os.environ.get("SERENA_PASCAL_ENABLE_RENAME", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            )
+            if not enable_rename:
+                raise RuntimeError(
+                    "Pascal rename is disabled by default because some pasls builds crash on textDocument/rename.\n"
+                    "Options:\n"
+                    "- Use `replace_content` with a word-boundary regex for safe rename-in-file.\n"
+                    "- Use JetBrains rename (if you run Serena in JetBrains mode).\n"
+                    "- OR explicitly enable pasls rename by setting env var: SERENA_PASCAL_ENABLE_RENAME=1"
+                )
+
         rename_result = lang_server.request_rename_symbol_edit(
             relative_file_path=relative_file_path, line=symbol.location.line, column=symbol.location.column, new_name=new_name
         )

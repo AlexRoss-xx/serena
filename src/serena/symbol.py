@@ -1,15 +1,20 @@
 import json
 import logging
 import os
+import shutil
+import subprocess
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict, Union, cast
 
 from sensai.util.string import ToStringMixin
 
 from solidlsp import SolidLanguageServer
+from solidlsp.ls_config import Language
 from solidlsp.ls import ReferenceInSymbol as LSPReferenceInSymbol
+from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.ls_types import Position, SymbolKind, UnifiedSymbolInformation
 
 from .ls_manager import LanguageServerManager
@@ -506,6 +511,11 @@ class LanguageServerSymbolRetriever:
         expr = name_path_pattern.strip()
         if not expr:
             return False
+        # IMPORTANT: patterns starting with "/" are absolute name paths within a file.
+        # WorkspaceSymbol results usually don't include reliable parent/container hierarchy,
+        # so we avoid the WorkspaceSymbol fast path for absolute patterns to preserve correctness.
+        if expr.startswith(NAME_PATH_SEP):
+            return False
         expr = expr.lstrip(NAME_PATH_SEP).rstrip(NAME_PATH_SEP)
         if not expr:
             return False
@@ -524,6 +534,22 @@ class LanguageServerSymbolRetriever:
 
     def get_language_server(self, relative_path: str) -> SolidLanguageServer:
         return self._ls_manager.get_language_server(relative_path)
+
+    def _call_with_restart_on_terminated(
+        self, lang_server: SolidLanguageServer, fn: Callable[[SolidLanguageServer], Any]
+    ) -> Any:
+        """
+        If a request fails because the LS process terminated, restart that LS and retry once.
+        This makes the system resilient against native crashes (e.g. pasls "Access violation").
+        """
+        try:
+            return fn(lang_server)
+        except SolidLSPException as e:
+            if not e.is_language_server_terminated():
+                raise
+            # Restart the affected language server and retry once
+            restarted = self._ls_manager.restart_language_server(lang_server.language)
+            return fn(restarted)
 
     def find(
         self,
@@ -544,14 +570,19 @@ class LanguageServerSymbolRetriever:
         if self._is_simple_name_pattern(name_path_pattern):
             query = name_path_pattern.strip().lstrip(NAME_PATH_SEP).rstrip(NAME_PATH_SEP)
             for lang_server in self._ls_manager.iter_language_servers():
-                ws = lang_server.request_workspace_symbol(query=query)
+                try:
+                    ws = lang_server.request_workspace_symbol(query=query)
+                except Exception:
+                    # Some servers throw if the workspace isn't configured (e.g. TS "No Project").
+                    # Treat this as "unsupported" and fall back to other strategies.
+                    continue
                 if not ws:
                     continue
 
                 for s_dict in ws:
                     # optional scope restriction: filter by path prefix (directory) or exact file (file)
                     if within_relative_path:
-                        loc = s_dict.get("location") or {}
+                        loc: dict[str, Any] = cast(dict[str, Any], s_dict.get("location") or {})
                         rel = loc.get("relativePath")
                         if isinstance(rel, str):
                             # normalize separators for prefix comparisons
@@ -575,9 +606,54 @@ class LanguageServerSymbolRetriever:
             if symbols:
                 return symbols
 
+            # Prefilter fallback: if workspace/symbol yields nothing (unsupported/disabled), avoid a full workspace scan.
+            # We try to narrow candidate files using ripgrep (if available), then only request document symbols for those files.
+            # This provides a major speedup on large workspaces where only a handful of files contain the identifier.
+            candidates = self._prefilter_candidate_files(query=query, within_relative_path=within_relative_path)
+            if candidates:
+                for lang_server in self._ls_manager.iter_language_servers():
+                    for rel_file in candidates:
+                        try:
+                            if lang_server.is_ignored_path(rel_file):
+                                continue
+                        except Exception:
+                            # best-effort filtering
+                            pass
+                        try:
+                            symbol_roots = self._call_with_restart_on_terminated(
+                                lang_server, lambda ls: ls.request_full_symbol_tree(within_relative_path=rel_file)
+                            )
+                        except Exception:
+                            continue
+                        for root in symbol_roots:
+                            symbols.extend(
+                                LanguageServerSymbol(root).find(
+                                    name_path_pattern,
+                                    include_kinds=include_kinds,
+                                    exclude_kinds=exclude_kinds,
+                                    substring_matching=substring_matching,
+                                )
+                            )
+                if symbols:
+                    return symbols
+
+            # Robustness guard (Pascal): if we couldn't narrow candidates cheaply, avoid the full workspace scan.
+            # Full scans are both extremely slow on large Pascal workspaces and can crash unstable pasls builds.
+            try:
+                if any(ls.language == Language.PASCAL for ls in self._ls_manager.iter_language_servers()):
+                    return []
+            except Exception:
+                # If we can't determine language, fall through to generic behavior.
+                pass
+
         # Fallback: full scan via symbol tree
         for lang_server in self._ls_manager.iter_language_servers():
-            symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
+            try:
+                symbol_roots = self._call_with_restart_on_terminated(
+                    lang_server, lambda ls: ls.request_full_symbol_tree(within_relative_path=within_relative_path)
+                )
+            except Exception:
+                continue
             for root in symbol_roots:
                 symbols.extend(
                     LanguageServerSymbol(root).find(
@@ -589,6 +665,226 @@ class LanguageServerSymbolRetriever:
                 )
         return symbols
 
+    def _prefilter_candidate_files(self, *, query: str, within_relative_path: str | None) -> list[str]:
+        """
+        Best-effort candidate file prefilter for cases where workspace/symbol is unavailable.
+
+        Uses ripgrep if present; otherwise falls back to `git grep` (fast on large repos), and finally
+        to a bounded filesystem scan.
+
+        Returns relative paths (OS-native separators ok).
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        root = self.get_root_path()
+        scope_rel = within_relative_path or "."
+        scope_abs = os.path.join(root, scope_rel) if within_relative_path else root
+
+        # If caller already restricts to a file, we're done.
+        if within_relative_path and os.path.isfile(scope_abs):
+            return [within_relative_path]
+
+        # Keep the candidate set bounded to avoid pathological cases.
+        # NOTE: This is a *prefilter* only. Keeping this number small is important to avoid accidentally
+        # dragging in thousands of files and turning this into "full scan" behavior.
+        max_candidates = 50
+
+        # Limit to likely source files for symbol definitions. For Pascal/Delphi workspaces, `.dfm` files are
+        # extremely common and often contain many incidental string matches; including them can explode runtime.
+        # (If a symbol truly only exists inside a .dfm, it's not a code symbol Serena can edit anyway.)
+        include_globs = [
+            "*.pas",
+            "*.pp",
+            "*.inc",
+        ]
+
+        def _normalize_and_cap(lines: list[str]) -> list[str]:
+            paths: list[str] = []
+            for line in lines:
+                p = (line or "").strip()
+                if not p:
+                    continue
+                # Normalize to a relative path under root if a tool returned absolute paths
+                if os.path.isabs(p):
+                    try:
+                        p = os.path.relpath(p, root)
+                    except Exception:
+                        continue
+                paths.append(p)
+                if len(paths) >= max_candidates:
+                    break
+            return paths
+
+        def _is_allowed_source_path(rel_path: str) -> bool:
+            # Keep in sync with include_globs above (extensions only).
+            _, ext = os.path.splitext(rel_path.lower())
+            return ext in {".pas", ".pp", ".inc"}
+
+        # 1) Prefer ripgrep (fastest, supports filesystem changes).
+        rg = shutil.which("rg")
+        if rg:
+            try:
+                proc = subprocess.run(
+                    [
+                        rg,
+                        "--files-with-matches",
+                        "--fixed-strings",
+                        "--no-messages",
+                        "--hidden",
+                        "--follow",
+                        *[g for glob in include_globs for g in ("--glob", glob)],
+                        query,
+                        scope_rel,
+                    ],
+                    cwd=root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                proc = None
+
+            if proc and proc.returncode in (0, 1):  # 0=matches, 1=no matches
+                candidates = _normalize_and_cap((proc.stdout or "").splitlines())
+                if candidates:
+                    return candidates
+                # Pascal is case-insensitive; try ignore-case if a case-sensitive search didn't match.
+                try:
+                    proc_i = subprocess.run(
+                        [
+                            rg,
+                            "--files-with-matches",
+                            "--fixed-strings",
+                            "--no-messages",
+                            "--hidden",
+                            "--follow",
+                            "--ignore-case",
+                            *[g for glob in include_globs for g in ("--glob", glob)],
+                            query,
+                            scope_rel,
+                        ],
+                        cwd=root,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if proc_i.returncode in (0, 1):
+                        candidates_i = _normalize_and_cap((proc_i.stdout or "").splitlines())
+                        if candidates_i:
+                            return candidates_i
+                except Exception:
+                    pass
+
+        # 2) Fall back to git grep (very fast on huge repos; searches tracked files).
+        git = shutil.which("git")
+        if git:
+            try:
+                # NOTE: We filter extensions in Python to keep the git invocation simple and robust across platforms.
+                proc = subprocess.run(
+                    [
+                        git,
+                        "-C",
+                        root,
+                        "grep",
+                        "-l",
+                        "-I",
+                        "--fixed-strings",
+                        "--no-color",
+                        "--no-messages",
+                        "--",
+                        query,
+                        scope_rel,
+                    ],
+                    cwd=root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                proc = None
+
+            if proc and proc.returncode in (0, 1):
+                lines = [ln for ln in (proc.stdout or "").splitlines() if _is_allowed_source_path(ln)]
+                candidates = _normalize_and_cap(lines)
+                if candidates:
+                    return candidates
+
+                # Pascal is case-insensitive; try ignore-case if needed.
+                try:
+                    proc_i = subprocess.run(
+                        [
+                            git,
+                            "-C",
+                            root,
+                            "grep",
+                            "-l",
+                            "-I",
+                            "-i",
+                            "--fixed-strings",
+                            "--no-color",
+                            "--no-messages",
+                            "--",
+                            query,
+                            scope_rel,
+                        ],
+                        cwd=root,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if proc_i.returncode in (0, 1):
+                        lines_i = [ln for ln in (proc_i.stdout or "").splitlines() if _is_allowed_source_path(ln)]
+                        candidates_i = _normalize_and_cap(lines_i)
+                        if candidates_i:
+                            return candidates_i
+                except Exception:
+                    pass
+
+        # 3) Last resort: bounded filesystem scan (covers untracked files / repos without git).
+        # Keep this conservative to avoid turning into a full scan.
+        try:
+            root_abs = root
+            start_dir = scope_abs if os.path.isdir(scope_abs) else root_abs
+            scanned = 0
+            found: list[str] = []
+            for dirpath, dirnames, filenames in os.walk(start_dir):
+                # Prune heavy/irrelevant directories.
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if d not in {".git", ".serena", "__pycache__", ".venv", "node_modules"}
+                    and not d.startswith(".mypy_cache")
+                    and not d.startswith(".pytest_cache")
+                ]
+                for fn in filenames:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext not in {".pas", ".pp", ".inc"}:
+                        continue
+                    scanned += 1
+                    if scanned > 2000:
+                        break
+                    abs_p = os.path.join(dirpath, fn)
+                    try:
+                        with open(abs_p, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read(256_000)  # cap per-file read; enough for unit header + typical symbol refs
+                    except Exception:
+                        continue
+                    if query in content or query.lower() in content.lower():
+                        try:
+                            rel = os.path.relpath(abs_p, root_abs)
+                        except Exception:
+                            continue
+                        found.append(rel)
+                        if len(found) >= max_candidates:
+                            break
+                if scanned > 2000 or len(found) >= max_candidates:
+                    break
+            return _normalize_and_cap(found)
+        except Exception:
+            return []
+
     def find_unique(
         self,
         name_path_pattern: str,
@@ -597,13 +893,47 @@ class LanguageServerSymbolRetriever:
         substring_matching: bool = False,
         within_relative_path: str | None = None,
     ) -> LanguageServerSymbol:
-        symbol_candidates = self.find(
-            name_path_pattern,
-            include_kinds=include_kinds,
-            exclude_kinds=exclude_kinds,
-            substring_matching=substring_matching,
-            within_relative_path=within_relative_path,
-        )
+        # For single-file scopes, prefer document symbols for correctness.
+        # WorkspaceSymbol results often have identifier-only ranges which break edit operations.
+        if within_relative_path:
+            try:
+                abs_scope = os.path.join(self.get_root_path(), within_relative_path)
+                if os.path.isfile(abs_scope):
+                    symbol_candidates: list[LanguageServerSymbol] = []
+                    lang_server = self.get_language_server(within_relative_path)
+                    for root in lang_server.request_full_symbol_tree(within_relative_path=within_relative_path):
+                        symbol_candidates.extend(
+                            LanguageServerSymbol(root).find(
+                                name_path_pattern,
+                                include_kinds=include_kinds,
+                                exclude_kinds=exclude_kinds,
+                                substring_matching=substring_matching,
+                            )
+                        )
+                else:
+                    symbol_candidates = self.find(
+                        name_path_pattern,
+                        include_kinds=include_kinds,
+                        exclude_kinds=exclude_kinds,
+                        substring_matching=substring_matching,
+                        within_relative_path=within_relative_path,
+                    )
+            except Exception:
+                symbol_candidates = self.find(
+                    name_path_pattern,
+                    include_kinds=include_kinds,
+                    exclude_kinds=exclude_kinds,
+                    substring_matching=substring_matching,
+                    within_relative_path=within_relative_path,
+                )
+        else:
+            symbol_candidates = self.find(
+                name_path_pattern,
+                include_kinds=include_kinds,
+                exclude_kinds=exclude_kinds,
+                substring_matching=substring_matching,
+                within_relative_path=within_relative_path,
+            )
         if len(symbol_candidates) == 1:
             return symbol_candidates[0]
         elif len(symbol_candidates) == 0:
@@ -623,10 +953,11 @@ class LanguageServerSymbolRetriever:
             )
 
     def find_by_location(self, location: LanguageServerSymbolLocation) -> LanguageServerSymbol | None:
-        if location.relative_path is None:
+        rel_path = location.relative_path
+        if rel_path is None:
             return None
-        lang_server = self.get_language_server(location.relative_path)
-        document_symbols = lang_server.request_document_symbols(location.relative_path)
+        lang_server = self.get_language_server(rel_path)
+        document_symbols = self._call_with_restart_on_terminated(lang_server, lambda ls: ls.request_document_symbols(rel_path))
         for symbol_dict in document_symbols.iter_symbols():
             symbol = LanguageServerSymbol(symbol_dict)
             if symbol.location == location:
@@ -654,12 +985,17 @@ class LanguageServerSymbolRetriever:
         """
         symbol = self.find_unique(name_path, substring_matching=False, within_relative_path=relative_file_path)
         return self.find_referencing_symbols_by_location(
-            symbol.location, include_body=include_body, include_kinds=include_kinds, exclude_kinds=exclude_kinds
+            symbol.location,
+            referenced_symbol_name=symbol.name,
+            include_body=include_body,
+            include_kinds=include_kinds,
+            exclude_kinds=exclude_kinds,
         )
 
     def find_referencing_symbols_by_location(
         self,
         symbol_location: LanguageServerSymbolLocation,
+        referenced_symbol_name: str | None = None,
         include_body: bool = False,
         include_kinds: Sequence[SymbolKind] | None = None,
         exclude_kinds: Sequence[SymbolKind] | None = None,
@@ -685,15 +1021,29 @@ class LanguageServerSymbolRetriever:
         assert symbol_location.line is not None
         assert symbol_location.column is not None
         lang_server = self.get_language_server(symbol_location.relative_path)
-        references = lang_server.request_referencing_symbols(
-            relative_file_path=symbol_location.relative_path,
-            line=symbol_location.line,
-            column=symbol_location.column,
-            include_imports=False,
-            include_self=False,
-            include_body=include_body,
-            include_file_symbols=True,
-        )
+        try:
+            references = lang_server.request_referencing_symbols(
+                relative_file_path=symbol_location.relative_path,
+                line=symbol_location.line,
+                column=symbol_location.column,
+                include_imports=False,
+                include_self=False,
+                include_body=include_body,
+                include_file_symbols=True,
+            )
+        except Exception as e:
+            # pasls can crash (native "Access violation") on textDocument/references for some symbols/projects.
+            # Provide a robust, fast fallback: text search for the identifier in Pascal source files.
+            if getattr(lang_server, "language", None) == Language.PASCAL:
+                query = (referenced_symbol_name or "").strip()
+                if not query:
+                    return []
+                return self._fallback_references_text_search(
+                    query=query,
+                    include_kinds=include_kinds,
+                    exclude_kinds=exclude_kinds,
+                )
+            raise
 
         if include_kinds is not None:
             references = [s for s in references if s.symbol["kind"] in include_kinds]
@@ -703,6 +1053,81 @@ class LanguageServerSymbolRetriever:
 
         return [ReferenceInLanguageServerSymbol.from_lsp_reference(r) for r in references]
 
+    def _fallback_references_text_search(
+        self,
+        *,
+        query: str,
+        include_kinds: Sequence[SymbolKind] | None,
+        exclude_kinds: Sequence[SymbolKind] | None,
+    ) -> list[ReferenceInLanguageServerSymbol]:
+        """
+        Fallback for unstable Pascal LS builds: approximate references using text search.
+
+        Returns file-level "symbols" with reference coordinates. This is meant to be robust and fast, not perfect.
+        """
+        # Use the same candidate prefilter machinery (rg/git grep + extension filtering).
+        candidates = self._prefilter_candidate_files(query=query, within_relative_path=None)
+        if not candidates:
+            return []
+
+        # Bound work to keep this predictable.
+        max_files = 25
+        max_total_refs = 200
+        max_refs_per_file = 20
+
+        root = self.get_root_path()
+
+        # Prefer identifier-like matches (word boundary). Pascal identifiers are [A-Za-z_][A-Za-z0-9_]*.
+        # We still fall back to substring match if the identifier boundary regex doesn't match.
+        ident_re = re.compile(rf"(?i)(?<![A-Za-z0-9_]){re.escape(query)}(?![A-Za-z0-9_])")
+
+        results: list[ReferenceInLanguageServerSymbol] = []
+        for rel_file in candidates[:max_files]:
+            abs_file = os.path.join(root, rel_file)
+            try:
+                with open(abs_file, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.read().splitlines()
+            except Exception:
+                continue
+
+            refs_in_file = 0
+            for i, line in enumerate(lines):
+                if refs_in_file >= max_refs_per_file or len(results) >= max_total_refs:
+                    break
+                m = ident_re.search(line)
+                if not m:
+                    # Last resort: cheap substring (keeps behavior close to previous "code search" expectations)
+                    idx = line.lower().find(query.lower())
+                    if idx < 0:
+                        continue
+                    col = idx
+                else:
+                    col = m.start()
+
+                file_symbol: UnifiedSymbolInformation = {
+                    "name": os.path.basename(rel_file),
+                    "kind": SymbolKind.File,
+                    "location": {
+                        "relativePath": rel_file,
+                        "absolutePath": abs_file,
+                        "uri": "",
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                    },
+                    "children": [],
+                }
+                results.append(ReferenceInLanguageServerSymbol(symbol=LanguageServerSymbol(file_symbol), line=i, character=col))
+                refs_in_file += 1
+
+            if len(results) >= max_total_refs:
+                break
+
+        # include/exclude kinds apply to the *referencing symbol*; here it's always a File kind.
+        if include_kinds is not None and SymbolKind.File not in include_kinds:
+            return []
+        if exclude_kinds is not None and SymbolKind.File in exclude_kinds:
+            return []
+        return results
+
     def get_symbol_overview(self, relative_path: str, depth: int = 0) -> dict[str, list[dict]]:
         """
         :param relative_path: the path of the file or directory for which to get the symbol overview
@@ -711,7 +1136,7 @@ class LanguageServerSymbolRetriever:
             For the case where a file is passed, the mapping will contain a single entry.
         """
         lang_server = self.get_language_server(relative_path)
-        path_to_unified_symbols = lang_server.request_overview(relative_path)
+        path_to_unified_symbols = self._call_with_restart_on_terminated(lang_server, lambda ls: ls.request_overview(relative_path))
 
         def child_inclusion_predicate(s: LanguageServerSymbol) -> bool:
             return not s.is_low_level()

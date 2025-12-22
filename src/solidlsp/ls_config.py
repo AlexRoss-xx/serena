@@ -165,7 +165,12 @@ class Language(str, Enum):
                 return FilenameMatcher("*.cpp", "*.h", "*.hpp", "*.c", "*.hxx", "*.cc", "*.cxx")
             case self.PASCAL:
                 # Pascal / Object Pascal / Delphi-style units & programs
-                return FilenameMatcher("*.pas", "*.pp", "*.lpr", "*.dpr", "*.dfm")
+                # NOTE: Do NOT include form resources like .dfm/.lfm here. pasls can't reliably provide symbols for
+                # those and attempting to treat them as source files can lead to slow scans and "No scanner found"
+                # errors on large workspaces.
+                # Also avoid project entrypoints like .dpr/.lpr/.dpk: some pasls builds crash on documentSymbol
+                # for these. For Serena's symbol work, units/includes are the primary targets.
+                return FilenameMatcher("*.pas", "*.pp", "*.inc")
             case self.KOTLIN:
                 return FilenameMatcher("*.kt", "*.kts")
             case self.DART:

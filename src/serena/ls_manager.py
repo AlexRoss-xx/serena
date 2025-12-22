@@ -20,6 +20,7 @@ class LanguageServerFactory:
         encoding: str,
         ignored_patterns: list[str],
         ls_timeout: float | None = None,
+        ls_startup_timeout: float | None = None,
         ls_specific_settings: dict | None = None,
         trace_lsp_communication: bool = False,
     ):
@@ -27,6 +28,9 @@ class LanguageServerFactory:
         self.encoding = encoding
         self.ignored_patterns = ignored_patterns
         self.ls_timeout = ls_timeout
+        # Startup timeout is applied to initialize/startup requests. If None, startup runs without per-request timeout.
+        # After startup, runtime request timeout is set to `ls_timeout`.
+        self.ls_startup_timeout = ls_timeout if ls_startup_timeout is None else ls_startup_timeout
         self.ls_specific_settings = ls_specific_settings
         self.trace_lsp_communication = trace_lsp_communication
 
@@ -42,7 +46,7 @@ class LanguageServerFactory:
         return SolidLanguageServer.create(
             ls_config,
             self.project_root,
-            timeout=self.ls_timeout,
+            timeout=self.ls_startup_timeout,
             solidlsp_settings=SolidLSPSettings(
                 solidlsp_dir=SerenaPaths().serena_user_home_dir,
                 project_data_relative_path=SERENA_MANAGED_DIR_NAME,
@@ -93,6 +97,8 @@ class LanguageServerManager:
                 with LogTime(f"Language server startup (language={language.value})"):
                     language_server = factory.create_language_server(language)
                     language_server.start()
+                    # After successful startup, apply the runtime request timeout (may differ from startup).
+                    language_server.set_request_timeout(factory.ls_timeout)
                     if not language_server.is_running():
                         raise RuntimeError(f"Failed to start the language server for language {language.value}")
                     with lock:

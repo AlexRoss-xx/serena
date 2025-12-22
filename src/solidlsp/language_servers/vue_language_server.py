@@ -8,6 +8,7 @@ import os
 import pathlib
 import shutil
 import threading
+from collections.abc import Hashable
 from pathlib import Path
 from time import sleep
 from typing import Any
@@ -726,7 +727,12 @@ class VueLanguageServer(SolidLanguageServer):
 
     @override
     def _request_document_symbols(
-        self, relative_file_path: str, file_data: LSPFileBuffer | None
+        self,
+        relative_file_path: str,
+        file_data: LSPFileBuffer | None,
+        *,
+        cache_fingerprint: Hashable | None = None,
+        use_cache: bool = True,
     ) -> list[SymbolInformation] | list[DocumentSymbol] | None:
         """
         Override to filter out shorthand property references in Vue files.
@@ -740,7 +746,9 @@ class VueLanguageServer(SolidLanguageServer):
         We filter out Property symbols that have a matching Variable with the same name
         at a different location (the definition), keeping only the definition.
         """
-        symbols = super()._request_document_symbols(relative_file_path, file_data)
+        symbols = super()._request_document_symbols(
+            relative_file_path, file_data, cache_fingerprint=cache_fingerprint, use_cache=use_cache
+        )
 
         if symbols is None or len(symbols) == 0:
             return symbols

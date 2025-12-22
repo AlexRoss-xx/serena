@@ -654,10 +654,29 @@ class SerenaAgent:
                 raise ValueError(f"Tool timeout must be at least 10 seconds, but is {tool_timeout} seconds")
             ls_timeout = tool_timeout - 5  # the LS timeout is for a single call, it should be smaller than the tool timeout
 
+        # Optional: allow disabling request timeouts specifically during LS startup/initialize.
+        # Useful for very large Pascal workspaces where initialization / symbol DB bootstrap can exceed the regular timeout.
+        # Set SERENA_LS_STARTUP_TIMEOUT to one of: "none"|"null" to disable, or a float seconds value.
+        startup_env = os.environ.get("SERENA_LS_STARTUP_TIMEOUT")
+        if startup_env is None:
+            ls_startup_timeout: float | None = ls_timeout
+        else:
+            v = startup_env.strip().lower()
+            if v in ("none", "null", "inf", "infinite", ""):
+                ls_startup_timeout = None
+            else:
+                try:
+                    ls_startup_timeout = float(v)
+                except ValueError as e:
+                    raise ValueError(
+                        f"Invalid SERENA_LS_STARTUP_TIMEOUT={startup_env!r}. Expected 'none'/'null' or a number of seconds."
+                    ) from e
+
         # instantiate and start the necessary language servers
         self.get_active_project_or_raise().create_language_server_manager(
             log_level=self.serena_config.log_level,
             ls_timeout=ls_timeout,
+            ls_startup_timeout=ls_startup_timeout,
             trace_lsp_communication=self.serena_config.trace_lsp_communication,
             ls_specific_settings=self.serena_config.ls_specific_settings,
         )

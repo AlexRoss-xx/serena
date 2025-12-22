@@ -53,6 +53,14 @@ class PowerShellLanguageServer(SolidLanguageServer):
         if pwsh:
             return pwsh
 
+        # Fallback on Windows: use Windows PowerShell if PowerShell Core is not installed.
+        # Prefer pwsh when available.
+        if platform.system() == "Windows":
+            win_ps = shutil.which("powershell") or shutil.which("powershell.exe")
+            if win_ps:
+                log.warning("PowerShell Core (pwsh) not found; falling back to Windows PowerShell at %s", win_ps)
+                return win_ps
+
         # Check common installation locations
         home = Path.home()
         system = platform.system()

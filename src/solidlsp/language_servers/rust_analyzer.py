@@ -7,8 +7,11 @@ import os
 import pathlib
 import subprocess
 import threading
+import gzip
+import platform
 from typing import cast
 
+import requests
 from overrides import override
 
 from solidlsp.ls import SolidLanguageServer
@@ -79,9 +82,13 @@ class RustAnalyzer(SolidLanguageServer):
 
         # Check if rustup is available
         if not RustAnalyzer._get_rustup_version():
+            # Fallback: download a rust-analyzer binary (useful for CI/Windows dev boxes without rustup)
+            downloaded = RustAnalyzer._download_rust_analyzer()
+            if downloaded:
+                return downloaded
             raise RuntimeError(
                 "Neither rust-analyzer nor rustup is installed.\n"
-                "Please install Rust via https://rustup.rs/ or install rust-analyzer separately."
+                "Install Rust via https://rustup.rs/ or install rust-analyzer separately."
             )
 
         # Try to install rust-analyzer component
@@ -95,6 +102,69 @@ class RustAnalyzer(SolidLanguageServer):
             raise RuntimeError("rust-analyzer installation succeeded but binary not found in PATH")
 
         return path
+
+    @staticmethod
+    def _download_rust_analyzer() -> str | None:
+        """
+        Download a prebuilt rust-analyzer binary from GitHub releases (latest) into the SolidLSP resources dir.
+        Returns the path to the downloaded executable, or None on failure.
+        """
+        try:
+            settings = SolidLSPSettings()
+            install_dir = pathlib.Path(RustAnalyzer.ls_resources_dir(settings)) / "bin"
+            install_dir.mkdir(parents=True, exist_ok=True)
+
+            system = platform.system()
+            machine = platform.machine().lower()
+
+            if system == "Windows":
+                # Most common Windows architecture
+                asset = "rust-analyzer-x86_64-pc-windows-msvc.exe.gz"
+                exe_name = "rust-analyzer.exe"
+            elif system == "Darwin":
+                if machine in ("arm64", "aarch64"):
+                    asset = "rust-analyzer-aarch64-apple-darwin.gz"
+                else:
+                    asset = "rust-analyzer-x86_64-apple-darwin.gz"
+                exe_name = "rust-analyzer"
+            else:
+                # Linux
+                if machine in ("arm64", "aarch64"):
+                    asset = "rust-analyzer-aarch64-unknown-linux-gnu.gz"
+                else:
+                    asset = "rust-analyzer-x86_64-unknown-linux-gnu.gz"
+                exe_name = "rust-analyzer"
+
+            target_path = install_dir / exe_name
+            if target_path.exists():
+                return str(target_path)
+
+            url = f"https://github.com/rust-lang/rust-analyzer/releases/latest/download/{asset}"
+            log.info("Downloading rust-analyzer from %s", url)
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+
+            gz_path = install_dir / asset
+            gz_path.write_bytes(resp.content)
+
+            with gzip.open(gz_path, "rb") as f_in:
+                target_path.write_bytes(f_in.read())
+            try:
+                gz_path.unlink()
+            except Exception:
+                pass
+
+            if system != "Windows":
+                try:
+                    target_path.chmod(0o755)
+                except Exception:
+                    pass
+
+            log.info("Installed rust-analyzer to %s", target_path)
+            return str(target_path)
+        except Exception as e:
+            log.warning("Failed to auto-download rust-analyzer: %s", e)
+            return None
 
     def __init__(self, config: LanguageServerConfig, repository_root_path: str, solidlsp_settings: SolidLSPSettings):
         """

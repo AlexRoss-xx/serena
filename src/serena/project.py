@@ -366,6 +366,7 @@ class Project(ToStringMixin):
         self,
         log_level: int = logging.INFO,
         ls_timeout: float | None = DEFAULT_TOOL_TIMEOUT - 5,
+        ls_startup_timeout: float | None = None,
         trace_lsp_communication: bool = False,
         ls_specific_settings: dict[Language, Any] | None = None,
     ) -> LanguageServerManager:
@@ -373,7 +374,9 @@ class Project(ToStringMixin):
         Creates the language server manager for the project, starting one language server per configured programming language.
 
         :param log_level: the log level for the language server
-        :param ls_timeout: the timeout for the language server
+        :param ls_timeout: the runtime timeout for language server requests (per-request). None disables request timeouts.
+        :param ls_startup_timeout: the timeout used during language server startup/initialize requests. If None, defaults to ls_timeout.
+            Set explicitly to None while keeping ls_timeout finite to allow slow initialization without affecting normal operation.
         :param trace_lsp_communication: whether to trace LSP communication
         :param ls_specific_settings: optional LS specific configuration of the language server,
             see docstrings in the inits of subclasses of SolidLanguageServer to see what values may be passed.
@@ -391,6 +394,7 @@ class Project(ToStringMixin):
             encoding=self.project_config.encoding,
             ignored_patterns=self._ignored_patterns,
             ls_timeout=ls_timeout,
+            ls_startup_timeout=ls_startup_timeout,
             ls_specific_settings=ls_specific_settings,
             trace_lsp_communication=trace_lsp_communication,
         )

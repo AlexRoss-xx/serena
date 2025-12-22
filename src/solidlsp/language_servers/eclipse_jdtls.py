@@ -9,6 +9,7 @@ import pathlib
 import shutil
 import threading
 import uuid
+from collections.abc import Hashable
 from pathlib import PurePath
 from typing import cast
 
@@ -780,9 +781,16 @@ class EclipseJDTLS(SolidLanguageServer):
         self.service_ready_event.wait()
 
     def _request_document_symbols(
-        self, relative_file_path: str, file_data: LSPFileBuffer | None
+        self,
+        relative_file_path: str,
+        file_data: LSPFileBuffer | None,
+        *,
+        cache_fingerprint: Hashable | None = None,
+        use_cache: bool = True,
     ) -> list[SymbolInformation] | list[DocumentSymbol] | None:
-        result = super()._request_document_symbols(relative_file_path, file_data=file_data)
+        result = super()._request_document_symbols(
+            relative_file_path, file_data=file_data, cache_fingerprint=cache_fingerprint, use_cache=use_cache
+        )
         if result is None:
             return None
 

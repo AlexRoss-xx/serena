@@ -78,6 +78,44 @@ class PascalLanguageServer(SolidLanguageServer):
         if os.name == "nt":
             log.info("Pascal LS Windows URI workaround enabled (file:/// -> file://)")
 
+    @staticmethod
+    @override
+    def _determine_log_level(line: str) -> int:
+        """
+        pasls sometimes logs full JSON-RPC payload fragments (including entire document text) to stderr.
+
+        This is extremely verbose and can contain words like "error"/"exception" inside the document text,
+        which would otherwise be misclassified as a real error by the default heuristic.
+        """
+        line_lower = (line or "").lower()
+
+        # If pasls dumps JSON-RPC payloads to stderr (common in verbose/debug builds),
+        # do not treat these as errors even if they contain words like "exception" as part of symbol names.
+        # Example: {"jsonrpc":"2.0","id":...,"result":[... "TCRThreadExceptionEvent" ...]}
+        if '"jsonrpc"' in line_lower and (line_lower.lstrip().startswith("{") or line_lower.lstrip().startswith("[")):
+            return logging.DEBUG
+
+        # Some pasls builds print JSON fragments across multiple stderr lines (e.g. just `"uri": "file://..."`).
+        # These may include filenames containing "Exception" and would otherwise be misclassified as errors.
+        if '"uri"' in line_lower and "file://" in line_lower:
+            return logging.DEBUG
+
+        # Some builds print file reload telemetry like:
+        # "Reloaded <path> in 729ms"
+        # Treat as INFO (not ERROR) even if the path contains "Exception".
+        if line_lower.lstrip().startswith("reloaded ") and " in " in line_lower and "ms" in line_lower:
+            return logging.INFO
+
+        # If the stderr line appears to include a JSON payload fragment with the `"text"` field (didOpen/didChange),
+        # treat it as DEBUG to avoid log spam and false-positive "ERROR" entries.
+        if '"text"' in line_lower and ("unit " in line_lower or "\\nunit " in line_lower or "interface" in line_lower):
+            return logging.DEBUG
+
+        # Fall back to the default heuristic.
+        if "error" in line_lower or "exception" in line_lower or (line or "").startswith("E["):
+            return logging.ERROR
+        return logging.INFO
+
     @override
     def is_ignored_dirname(self, dirname: str) -> bool:
         """Extend default ignored directories with Pascal-specific build folders.
@@ -216,6 +254,22 @@ class PascalLanguageServer(SolidLanguageServer):
         symbol_db_path = os.path.join(repository_absolute_path, ".serena", "cache", "pascal", "symbols.db")
         os.makedirs(os.path.dirname(symbol_db_path), exist_ok=True)
         
+        def _env_flag(name: str, default: bool) -> bool:
+            val = os.environ.get(name)
+            if val is None:
+                return default
+            val = val.strip().lower()
+            if val in ("1", "true", "yes", "y", "on"):
+                return True
+            if val in ("0", "false", "no", "n", "off"):
+                return False
+            return default
+
+        # Workspace symbol support is a major performance lever for global symbol search, BUT some pasls builds
+        # crash during `initialize` when this is enabled (native "Access violation"/terminated stdout reader).
+        # For robustness we keep it OFF by default; enable explicitly via env var if your pasls build is stable.
+        workspace_symbols_enabled = _env_flag("SERENA_PASCAL_WORKSPACE_SYMBOLS", False)
+
         initialize_params: dict[str, Any] = {
             "locale": "en",
             "initializationOptions": {
@@ -225,9 +279,9 @@ class PascalLanguageServer(SolidLanguageServer):
                 "program": "",
                 # Enable SQLite symbol database for production performance
                 "symbolDatabase": symbol_db_path,
-                # Disable workspace symbol scanning during initialization to avoid timeout
-                # on large projects. Database will build lazily on-demand.
-                "workspaceSymbols": False,
+                # Workspace symbol support is a major performance lever for global symbol search.
+                # If you hit LS initialization issues on huge workspaces, set SERENA_PASCAL_WORKSPACE_SYMBOLS=0.
+                "workspaceSymbols": workspace_symbols_enabled,
             },
             "capabilities": {
                 "textDocument": {

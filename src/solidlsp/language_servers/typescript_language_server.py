@@ -300,7 +300,9 @@ class TypeScriptLanguageServer(SolidLanguageServer):
 
     @override
     def _get_wait_time_for_cross_file_referencing(self) -> float:
-        return 1
+        # TypeScript server can take noticeably longer on Windows to build the initial project graph.
+        # Without this, cross-file references may be incomplete (only same-file results).
+        return 3.0 if os.name == "nt" else 1.0
 
     @override
     def _get_preferred_definition(self, definitions: list[ls_types.Location]) -> ls_types.Location:
