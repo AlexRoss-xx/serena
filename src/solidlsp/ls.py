@@ -146,7 +146,7 @@ class SolidLanguageServer(ABC):
     """
     RAW_DOCUMENT_SYMBOL_CACHE_FILENAME = "raw_document_symbols.pkl"
     RAW_DOCUMENT_SYMBOL_CACHE_FILENAME_LEGACY_FALLBACK = "document_symbols_cache_v23-06-25.pkl"
-    DOCUMENT_SYMBOL_CACHE_VERSION = 3
+    DOCUMENT_SYMBOL_CACHE_VERSION = 4
     DOCUMENT_SYMBOL_CACHE_FILENAME = "document_symbols.pkl"
 
     # To be overridden and extended by subclasses
@@ -971,7 +971,19 @@ class SolidLanguageServer(ABC):
 
             # no cached result, query language server
             log.debug(f"Requesting document symbols for {relative_file_path} from the Language Server")
-            response = self.server.send.document_symbol({"textDocument": {"uri": fd.uri}})
+            try:
+                response = self.server.send.document_symbol({"textDocument": {"uri": fd.uri}})
+            except TimeoutError as e:
+                # Log the timeout and return empty result instead of propagating
+                # This allows symbol search to continue for other files
+                log.warning(
+                    f"Document symbol request timed out for {relative_file_path}. "
+                    f"File may be too complex or large. Skipping and continuing with other files. Error: {e}"
+                )
+                # Cache empty result to avoid re-attempting on subsequent queries
+                self._raw_document_symbols_cache[cache_key] = (fd.content_hash, None)
+                self._raw_document_symbols_cache_is_modified = True
+                return None
 
             # update cache
             self._raw_document_symbols_cache[cache_key] = (fd.content_hash, response)
@@ -1026,8 +1038,6 @@ class SolidLanguageServer(ABC):
             assert isinstance(root_symbols, list), f"Unexpected response from Language Server: {root_symbols}"
             log.debug("Received %d root symbols for %s from the language server", len(root_symbols), relative_file_path)
 
-            file_lines = file_data.split_lines()
-
             def convert_to_unified_symbol(original_symbol_dict: GenericDocumentSymbol) -> ls_types.UnifiedSymbolInformation:
                 """
                 Converts the given symbol dictionary to the unified representation, ensuring
@@ -1057,8 +1067,8 @@ class SolidLanguageServer(ABC):
                 if "relativePath" not in location:
                     location["relativePath"] = relative_file_path  # type: ignore
 
-                if "body" not in item:
-                    item["body"] = self.retrieve_symbol_body(item, file_lines=file_lines)
+                # Do NOT eagerly compute symbol bodies here (it is expensive and not needed for most operations).
+                # Bodies are loaded lazily when explicitly requested (e.g. by tools with include_body=True).
 
                 # handle missing selectionRange
                 if "selectionRange" not in item:
@@ -1832,6 +1842,23 @@ class SolidLanguageServer(ABC):
             assert LSPConstants.NAME in item
             assert LSPConstants.KIND in item
             assert LSPConstants.LOCATION in item
+
+            # Normalize workspace symbols to the unified shape we use elsewhere.
+            # Some servers only provide `location.range`, omit `range`/`selectionRange`,
+            # and never populate `absolutePath`/`relativePath`.
+            try:
+                loc = item.get(LSPConstants.LOCATION, {})
+                if isinstance(loc, dict) and "uri" in loc and "range" in loc:
+                    abs_path = PathUtils.uri_to_path(loc["uri"])
+                    loc["absolutePath"] = abs_path
+                    loc["relativePath"] = PathUtils.get_relative_path(abs_path, self.repository_root_path)
+                    item[LSPConstants.LOCATION] = loc
+                    item.setdefault("range", loc["range"])
+                    item.setdefault("selectionRange", loc["range"])
+                item.setdefault("children", [])
+            except Exception:
+                # Best-effort normalization; keep raw data if anything goes wrong
+                pass
 
             ret.append(ls_types.UnifiedSymbolInformation(**item))  # type: ignore
 

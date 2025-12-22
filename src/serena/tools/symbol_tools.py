@@ -144,6 +144,21 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
             substring_matching=substring_matching,
             within_relative_path=relative_path,
         )
+        # Lazily load bodies only when explicitly requested.
+        # We avoid eager body extraction during indexing because it is expensive.
+        if include_body:
+            for s in symbols:
+                if s.body is not None:
+                    continue
+                rel = s.relative_path
+                if rel is None:
+                    continue
+                try:
+                    ls = symbol_retriever.get_language_server(rel)
+                    s.symbol_root["body"] = ls.retrieve_symbol_body(s.symbol_root)
+                except Exception:
+                    # Best-effort: if body retrieval fails (unsupported symbol shape, etc.), still return symbol metadata.
+                    pass
         symbol_dicts = [_sanitize_symbol_dict(s.to_dict(kind=True, location=True, depth=depth, include_body=include_body)) for s in symbols]
         result = self._to_json(symbol_dicts)
         return self._limit_length(result, max_answer_chars)

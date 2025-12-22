@@ -68,6 +68,11 @@ class PascalLanguageServer(SolidLanguageServer):
             solidlsp_settings,
         )
 
+        # Set generous timeout for Pascal on large projects (e.g., Profile with 1000+ files)
+        # Large Delphi codebases with type libraries and complex generics can take time to parse
+        # Initial workspace indexing for symbol database can take 10-15 minutes on very large projects
+        self.set_request_timeout(1200.0)  # 20 minutes for initialization and individual LSP requests
+
         self.server_ready = threading.Event()
         self.request_id = 0
         if os.name == "nt":
@@ -207,6 +212,10 @@ class PascalLanguageServer(SolidLanguageServer):
         if source_dirs:
             log.debug(f"fpcOptions count: {len(fpc_options)}")
 
+        # Enable persistent symbol database for faster symbol queries on large projects
+        symbol_db_path = os.path.join(repository_absolute_path, ".serena", "cache", "pascal", "symbols.db")
+        os.makedirs(os.path.dirname(symbol_db_path), exist_ok=True)
+        
         initialize_params: dict[str, Any] = {
             "locale": "en",
             "initializationOptions": {
@@ -214,7 +223,11 @@ class PascalLanguageServer(SolidLanguageServer):
                 "fpcOptions": fpc_options,
                 # Ensure the LS knows we want it to parse the program
                 "program": "",
-                "symbolDatabase": "",
+                # Enable SQLite symbol database for production performance
+                "symbolDatabase": symbol_db_path,
+                # Disable workspace symbol scanning during initialization to avoid timeout
+                # on large projects. Database will build lazily on-demand.
+                "workspaceSymbols": False,
             },
             "capabilities": {
                 "textDocument": {

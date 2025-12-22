@@ -496,6 +496,29 @@ class LanguageServerSymbolRetriever:
         self._ls_manager: LanguageServerManager = ls_manager
         self.agent = agent
 
+    @staticmethod
+    def _is_simple_name_pattern(name_path_pattern: str) -> bool:
+        """
+        :return: True if the pattern is a single-segment name (optionally absolute), without overload selector.
+            Examples: "Foo", "/Foo"
+            Non-examples: "Foo/bar", "Foo[0]", "/Foo/bar"
+        """
+        expr = name_path_pattern.strip()
+        if not expr:
+            return False
+        expr = expr.lstrip(NAME_PATH_SEP).rstrip(NAME_PATH_SEP)
+        if not expr:
+            return False
+        if NAME_PATH_SEP in expr:
+            return False
+        # Reject overload selectors like "Foo[0]"
+        if expr.endswith("]") and "[" in expr:
+            bracket_idx = expr.rfind("[")
+            index_part = expr[bracket_idx + 1 : -1]
+            if index_part.isdigit():
+                return False
+        return True
+
     def get_root_path(self) -> str:
         return self._ls_manager.get_root_path()
 
@@ -515,12 +538,53 @@ class LanguageServerSymbolRetriever:
         optionally limited to a specific file and filtered by kind.
         """
         symbols: list[LanguageServerSymbol] = []
+
+        # Fast path: if the query is just a single name, prefer LSP workspace/symbol.
+        # This avoids walking all files (request_full_symbol_tree) and is typically much faster on large projects.
+        if self._is_simple_name_pattern(name_path_pattern):
+            query = name_path_pattern.strip().lstrip(NAME_PATH_SEP).rstrip(NAME_PATH_SEP)
+            for lang_server in self._ls_manager.iter_language_servers():
+                ws = lang_server.request_workspace_symbol(query=query)
+                if not ws:
+                    continue
+
+                for s_dict in ws:
+                    # optional scope restriction: filter by path prefix (directory) or exact file (file)
+                    if within_relative_path:
+                        loc = s_dict.get("location") or {}
+                        rel = loc.get("relativePath")
+                        if isinstance(rel, str):
+                            # normalize separators for prefix comparisons
+                            rel_norm = rel.replace("\\", "/")
+                            scope_norm = within_relative_path.replace("\\", "/").rstrip("/")
+                            if scope_norm and not (rel_norm == scope_norm or rel_norm.startswith(scope_norm + "/")):
+                                continue
+
+                    # kind filters (workspace symbols use numeric kinds)
+                    kind_val = s_dict.get("kind")
+                    if include_kinds is not None and kind_val not in include_kinds:
+                        continue
+                    if exclude_kinds is not None and kind_val in exclude_kinds:
+                        continue
+
+                    ls_symbol = LanguageServerSymbol(s_dict)
+                    # apply our name-path matcher semantics (exact vs substring)
+                    if ls_symbol.find(name_path_pattern, substring_matching=substring_matching):
+                        symbols.append(ls_symbol)
+
+            if symbols:
+                return symbols
+
+        # Fallback: full scan via symbol tree
         for lang_server in self._ls_manager.iter_language_servers():
             symbol_roots = lang_server.request_full_symbol_tree(within_relative_path=within_relative_path)
             for root in symbol_roots:
                 symbols.extend(
                     LanguageServerSymbol(root).find(
-                        name_path_pattern, include_kinds=include_kinds, exclude_kinds=exclude_kinds, substring_matching=substring_matching
+                        name_path_pattern,
+                        include_kinds=include_kinds,
+                        exclude_kinds=exclude_kinds,
+                        substring_matching=substring_matching,
                     )
                 )
         return symbols
