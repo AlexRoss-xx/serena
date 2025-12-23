@@ -344,6 +344,59 @@ class FindIdentifierFastTool(Tool, ToolMarkerSymbolicRead):
                             if len(candidate_files) >= max_files:
                                 break
 
+        # 3) Last resort: bounded filesystem scan (works outside git repos and without rg).
+        if not candidate_files and not matches:
+            # Best-effort extension filter derived from the default Pascal globs.
+            allowed_exts = {".pas", ".pp", ".inc", ".dpr", ".lpr", ".dpk"}
+            if globs and include_globs.strip() != "*.{pas,pp,inc,dpr,lpr,dpk}":
+                # If caller passed custom globs, don't guess too much; scan all files.
+                allowed_exts = set()
+
+            scope_walk_root = scope_abs if os.path.isdir(scope_abs) else os.path.dirname(scope_abs)
+            if os.path.isfile(scope_abs):
+                files_to_scan = [scope_abs]
+            else:
+                files_to_scan = []
+                for dirpath, _, filenames in os.walk(scope_walk_root):
+                    for fn in filenames:
+                        abs_fp = os.path.join(dirpath, fn)
+                        rel_fp = os.path.relpath(abs_fp, root).replace("\\", "/")
+                        _, ext = os.path.splitext(fn.lower())
+                        if allowed_exts and ext not in allowed_exts:
+                            continue
+                        files_to_scan.append(abs_fp)
+                        if len(files_to_scan) >= max_files:
+                            break
+                    if len(files_to_scan) >= max_files:
+                        break
+
+            needle = identifier.lower() if case_insensitive else identifier
+            for abs_fp in files_to_scan:
+                rel_fp = os.path.relpath(abs_fp, root).replace("\\", "/")
+                try:
+                    with open(abs_fp, "r", encoding="utf-8", errors="replace") as f:
+                        per_file_hits = 0
+                        for i, line in enumerate(f, start=1):
+                            hay = line.lower() if case_insensitive else line
+                            idx = hay.find(needle)
+                            if idx < 0:
+                                continue
+                            matches.append(
+                                {
+                                    "relative_path": rel_fp,
+                                    "line": i,
+                                    "column": idx + 1,
+                                    "text": line.rstrip("\n"),
+                                }
+                            )
+                            per_file_hits += 1
+                            if per_file_hits >= max_matches_per_file:
+                                break
+                    if any(m["relative_path"] == rel_fp for m in matches):
+                        candidate_files.append(rel_fp)
+                except Exception:
+                    continue
+
         result_obj = {
             "identifier": identifier,
             "scope": relative_path or "",
