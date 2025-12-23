@@ -347,13 +347,13 @@ class PascalLanguageServer(SolidLanguageServer):
 
         return super().is_ignored_dirname(dirname) or dirname_lower in all_ignored
 
-    @override
     def _path_to_uri(self, absolute_file_path: str) -> str:
         """
         Pasls (genericptr / CGE fork) on Windows expects file URIs in the form `file://D:/...`
         (two slashes) and may return `null` for requests when given the standard `file:///D:/...`.
         """
-        uri = super()._path_to_uri(absolute_file_path)
+        from solidlsp.ls_utils import PathUtils
+        uri = PathUtils.path_to_uri(absolute_file_path)
         if os.name == "nt" and uri.startswith("file:///"):
             return uri.replace("file:///", "file://", 1)
         return uri

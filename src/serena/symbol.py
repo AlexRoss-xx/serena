@@ -598,6 +598,9 @@ class LanguageServerSymbolRetriever:
                     if exclude_kinds is not None and kind_val in exclude_kinds:
                         continue
 
+                    # Workspace symbols are typically flat (no children key), ensure it exists.
+                    if "children" not in s_dict:
+                        s_dict["children"] = []
                     ls_symbol = LanguageServerSymbol(s_dict)
                     # apply our name-path matcher semantics (exact vs substring)
                     if ls_symbol.find(name_path_pattern, substring_matching=substring_matching):
