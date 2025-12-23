@@ -7,6 +7,8 @@ import os
 import pathlib
 import shutil
 import threading
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any, Final, cast
 
 from overrides import override
@@ -20,6 +22,7 @@ from solidlsp.settings import SolidLSPSettings
 log = logging.getLogger(__name__)
 
 _PASLS_ENV_VAR: Final[str] = "SERENA_PASLS_PATH"
+_PASCAL_PROGRAM_ENV_VAR: Final[str] = "SERENA_PASCAL_PROGRAM"
 
 
 class PascalLanguageServer(SolidLanguageServer):
@@ -60,6 +63,14 @@ class PascalLanguageServer(SolidLanguageServer):
             env["PATH"] = fpc_path + os.pathsep + env.get("PATH", "")
             log.info(f"Using explicitly configured FPC path: {fpc_path}")
 
+        # CodeTools (used by pasls) relies on compiler/environment variables on many setups,
+        # especially on Windows: PP, FPCDIR, LAZARUSDIR, FPCTARGET, FPCTARGETCPU.
+        # Other clients (e.g. pasls-vscode / Emacs integrations) commonly set these.
+        # If missing, CodeTools may fail to resolve includes (e.g. {$I UDefs.inc}) and
+        # cross-file symbol operations become unreliable.
+        if os.name == "nt":
+            self._ensure_codetools_env_windows(env)
+
         super().__init__(
             config,
             repository_root_path,
@@ -77,6 +88,172 @@ class PascalLanguageServer(SolidLanguageServer):
         self.request_id = 0
         if os.name == "nt":
             log.info("Pascal LS Windows URI workaround enabled (file:/// -> file://)")
+
+    @staticmethod
+    def _ensure_codetools_env_windows(env: dict[str, str]) -> None:
+        """
+        Best-effort setup for Lazarus/FreePascal environment variables required by CodeTools.
+
+        Precedence:
+        - If the user already defined PP/FPCDIR/LAZARUSDIR, keep them.
+        - Otherwise, try to auto-detect Lazarus in common locations (C:\\lazarus).
+
+        Users can also provide explicit overrides:
+        - SERENA_PASCAL_PP, SERENA_PASCAL_FPCDIR, SERENA_PASCAL_LAZARUSDIR,
+          SERENA_PASCAL_FPCTARGET, SERENA_PASCAL_FPCTARGETCPU
+        """
+
+        def _set_if_missing(key: str, value: str) -> None:
+            if not env.get(key) and value:
+                env[key] = value
+
+        def _infer_target_from_pp(pp_path: str) -> tuple[str, str] | None:
+            """
+            Infer FPCTARGET/FPCTARGETCPU from compiler executable name when only one toolchain is installed.
+            Common on Windows setups where only i386-win32 exists (ppc386.exe).
+            """
+            if not pp_path:
+                return None
+            name = Path(pp_path).name.lower()
+            # FPC compiler names:
+            # - ppc386.exe -> i386 / win32
+            # - ppcx64.exe / ppcx86_64.exe -> x86_64 / win64
+            if "ppc386" in name:
+                return ("win32", "i386")
+            if "ppcx64" in name or "ppcx86_64" in name or "ppcx86-64" in name:
+                return ("win64", "x86_64")
+            return None
+
+        # Explicit overrides (project/user can set these)
+        _set_if_missing("PP", env.get("SERENA_PASCAL_PP", ""))
+        _set_if_missing("FPCDIR", env.get("SERENA_PASCAL_FPCDIR", ""))
+        _set_if_missing("LAZARUSDIR", env.get("SERENA_PASCAL_LAZARUSDIR", ""))
+        _set_if_missing("FPCTARGET", env.get("SERENA_PASCAL_FPCTARGET", ""))
+        _set_if_missing("FPCTARGETCPU", env.get("SERENA_PASCAL_FPCTARGETCPU", ""))
+
+        if env.get("PP") and env.get("FPCDIR") and env.get("LAZARUSDIR"):
+            # If caller didn't specify target, infer from PP (most reliable on "only i386-win32 installed").
+            if not env.get("FPCTARGET") or not env.get("FPCTARGETCPU"):
+                inferred = _infer_target_from_pp(env.get("PP", ""))
+                if inferred:
+                    _set_if_missing("FPCTARGET", inferred[0])
+                    _set_if_missing("FPCTARGETCPU", inferred[1])
+            # Back-compat defaults
+            _set_if_missing("FPCTARGET", "win32")
+            _set_if_missing("FPCTARGETCPU", "i386")
+            return
+
+        lazarus_dir = Path(env.get("LAZARUSDIR", "")).expanduser()
+        if not lazarus_dir.exists():
+            # common default
+            lazarus_dir = Path(r"C:\lazarus")
+
+        if lazarus_dir.exists():
+            _set_if_missing("LAZARUSDIR", str(lazarus_dir))
+            fpc_root = lazarus_dir / "fpc"
+            # pick latest version directory if present
+            fpc_version_dir: Path | None = None
+            if fpc_root.exists():
+                versions = [p for p in fpc_root.iterdir() if p.is_dir()]
+                # Prefer semver-ish name sorting
+                versions.sort(key=lambda p: p.name)
+                if versions:
+                    fpc_version_dir = versions[-1]
+
+            if fpc_version_dir:
+                _set_if_missing("FPCDIR", str(fpc_version_dir))
+                ppc = fpc_version_dir / "bin" / "i386-win32" / "ppc386.exe"
+                if ppc.exists():
+                    _set_if_missing("PP", str(ppc))
+                    # Ensure compiler dir is on PATH as well (helps CodeToolsOptions.InitWithEnvironmentVariables)
+                    env["PATH"] = str(ppc.parent) + os.pathsep + env.get("PATH", "")
+                    # If target vars are missing, infer them from the compiler we just selected.
+                    if not env.get("FPCTARGET") or not env.get("FPCTARGETCPU"):
+                        inferred = _infer_target_from_pp(str(ppc))
+                        if inferred:
+                            _set_if_missing("FPCTARGET", inferred[0])
+                            _set_if_missing("FPCTARGETCPU", inferred[1])
+                    _set_if_missing("FPCTARGET", "win32")
+                    _set_if_missing("FPCTARGETCPU", "i386")
+
+    def _try_load_delphi_dproj_paths(self, repository_absolute_path: str) -> tuple[list[str], list[str]]:
+        """
+        Best-effort extraction of Delphi build configuration from a .dproj adjacent to the configured program.
+
+        For Delphi codebases (like Profile), semantic resolution in CodeTools depends on matching the
+        *real* UnitSearchPath/Defines from the Delphi project. We extract:
+        - DCC_UnitSearchPath (as directories)
+        - DCC_Define (as -d defines)
+        """
+        cfg_program = str(self._custom_settings.get("program", "")).strip()
+        env_program = os.environ.get(_PASCAL_PROGRAM_ENV_VAR, "").strip()
+        program_spec = env_program or cfg_program
+        if not program_spec:
+            return ([], [])
+
+        program_path = program_spec
+        if not os.path.isabs(program_path):
+            program_path = os.path.join(repository_absolute_path, program_path)
+        program_path = os.path.abspath(program_path)
+        if not os.path.isfile(program_path):
+            return ([], [])
+
+        dproj_path = os.path.splitext(program_path)[0] + ".dproj"
+        if not os.path.isfile(dproj_path):
+            return ([], [])
+
+        try:
+            tree = ET.parse(dproj_path)
+            root = tree.getroot()
+        except Exception as e:
+            log.warning("Failed parsing Delphi .dproj (%s): %s", dproj_path, e)
+            return ([], [])
+
+        ns = {"msb": "http://schemas.microsoft.com/developer/msbuild/2003"}
+
+        # Collect all occurrences (different property groups may append with $(DCC_...))
+        unit_search_values: list[str] = []
+        define_values: list[str] = []
+        for el in root.findall(".//msb:DCC_UnitSearchPath", ns):
+            if el.text:
+                unit_search_values.append(el.text)
+        for el in root.findall(".//msb:DCC_Define", ns):
+            if el.text:
+                define_values.append(el.text)
+
+        base_dir = os.path.dirname(dproj_path)
+
+        def _norm_dir(p: str) -> str:
+            p = p.strip()
+            if not p or "$(" in p:
+                return ""
+            if not os.path.isabs(p):
+                p = os.path.join(base_dir, p)
+            p = os.path.abspath(p)
+            return p if os.path.isdir(p) else ""
+
+        dirs: list[str] = []
+        seen_dirs: set[str] = set()
+        for raw in unit_search_values:
+            for part in raw.split(";"):
+                d = _norm_dir(part)
+                if d and d not in seen_dirs:
+                    seen_dirs.add(d)
+                    dirs.append(d)
+
+        defines: list[str] = []
+        seen_def: set[str] = set()
+        for raw in define_values:
+            for part in raw.split(";"):
+                part = part.strip()
+                if not part or "$(" in part:
+                    continue
+                if part not in seen_def:
+                    seen_def.add(part)
+                    defines.append(part)
+
+        log.info("Loaded Delphi .dproj config: dirs=%d defines=%d (%s)", len(dirs), len(defines), dproj_path)
+        return (dirs, defines)
 
     @staticmethod
     @override
@@ -194,7 +371,12 @@ class PascalLanguageServer(SolidLanguageServer):
         """
         valid_extensions = {".pas", ".pp", ".inc"}
         source_dirs: set[str] = set()
-        max_dirs = 1000  # Increased limit for large Delphi projects like Profile
+        # Increased limit for large Delphi projects like Profile, but allow overriding
+        # since some pasls builds become unstable with huge option lists.
+        try:
+            max_dirs = int(os.environ.get("SERENA_PASCAL_MAX_SOURCE_DIRS", "1000"))
+        except ValueError:
+            max_dirs = 1000
 
         for root, dirs, files in os.walk(root_path):
             # Prune ignored directories in-place
@@ -230,25 +412,66 @@ class PascalLanguageServer(SolidLanguageServer):
         if os.name == "nt" and root_uri.startswith("file:///"):
             root_uri = root_uri.replace("file:///", "file://")
 
-        # Dynamically scan for source directories to set as search paths
-        # This avoids the need for manual configuration files like .fp-params
-        source_dirs = self._scan_for_source_dirs(repository_absolute_path)
-
         # Start with Delphi compatibility mode
         fpc_options = ["-Mdelphi"]
 
-        # Add all discovered source directories as unit and include paths
-        for src_dir in sorted(source_dirs):  # Sort for consistent ordering
-            # Add as unit path (-Fu) and include path (-Fi)
-            # We use absolute paths to be safe
-            fpc_options.append(f"-Fu{src_dir}")
-            fpc_options.append(f"-Fi{src_dir}")
+        # If a `castle-pasls.ini` exists at the repo root, prefer to keep initializationOptions.fpcOptions minimal.
+        # The genericptr fork can read this ini automatically and inject a large set of -Fu/-Fi paths itself.
+        # Passing thousands of options through LSP initialization can make some pasls builds unstable.
+        castle_ini = os.path.join(repository_absolute_path, "castle-pasls.ini")
+        force_scan_from_cfg = bool(self._custom_settings.get("force_scan_source_dirs", False))
+        use_castle_ini_only = (
+            os.path.isfile(castle_ini)
+            and not force_scan_from_cfg
+            and os.environ.get("SERENA_PASCAL_FORCE_SCAN_SOURCE_DIRS", "").strip() not in {
+            "1",
+            "true",
+            "True",
+            }
+        )
 
-        log.info(f"Pascal LSP configured for {os.path.basename(repository_absolute_path)} with {len(source_dirs)} source directories")
+        if use_castle_ini_only:
+            # Minimal set: allow resolving units relative to repo root; let castle-pasls.ini inject the rest.
+            fpc_options.append(f"-Fu{repository_absolute_path}")
+            fpc_options.append(f"-Fi{repository_absolute_path}")
+            # Semantic boost: import Delphi .dproj UnitSearchPath/Defines next to the configured program.
+            dproj_dirs, dproj_defines = self._try_load_delphi_dproj_paths(repository_absolute_path)
+            for d in dproj_dirs:
+                fpc_options.append(f"-Fu{d}")
+                # Delphi UnitSearchPath is commonly used for both units and includes
+                fpc_options.append(f"-Fi{d}")
+                fpc_options.append(f"-I{d}")
+            for define in dproj_defines:
+                fpc_options.append(f"-d{define}")
+            log.info(
+                "castle-pasls.ini detected; using minimal fpcOptions "
+                "(set SERENA_PASCAL_FORCE_SCAN_SOURCE_DIRS=1 or ls_specific_settings.pascal.force_scan_source_dirs=true to override)."
+            )
+            source_dirs: set[str] = set()
+        else:
+            # Dynamically scan for source directories to set as search paths
+            # This avoids the need for manual configuration files like .fp-params
+            source_dirs = self._scan_for_source_dirs(repository_absolute_path)
 
-        # Log the fpcOptions at debug level for troubleshooting
-        if source_dirs:
-            log.debug(f"fpcOptions count: {len(fpc_options)}")
+            # Add all discovered source directories as unit and include paths
+            for src_dir in sorted(source_dirs):  # Sort for consistent ordering
+                # CodeTools parses compiler options from a command-line-like string.
+                # Unquoted paths containing spaces can break parsing (and lead to missing include/unit paths),
+                # which in turn causes spurious "include file not found" / 0-reference results.
+                # We skip such paths to keep the configuration robust.
+                if " " in src_dir:
+                    log.debug("Skipping Pascal source dir with spaces (CodeTools parsing hazard): %s", src_dir)
+                    continue
+                # Add as unit path (-Fu) and include path (-Fi)
+                # We use absolute paths to be safe
+                fpc_options.append(f"-Fu{src_dir}")
+                fpc_options.append(f"-Fi{src_dir}")
+
+            log.info(f"Pascal LSP configured for {os.path.basename(repository_absolute_path)} with {len(source_dirs)} source directories")
+
+            # Log the fpcOptions at debug level for troubleshooting
+            if source_dirs:
+                log.debug(f"fpcOptions count: {len(fpc_options)}")
 
         # Enable persistent symbol database for faster symbol queries on large projects
         symbol_db_path = os.path.join(repository_absolute_path, ".serena", "cache", "pascal", "symbols.db")
@@ -270,13 +493,40 @@ class PascalLanguageServer(SolidLanguageServer):
         # For robustness we keep it OFF by default; enable explicitly via env var if your pasls build is stable.
         workspace_symbols_enabled = _env_flag("SERENA_PASCAL_WORKSPACE_SYMBOLS", False)
 
+        # Option A: Configure a single "program root" (.dpr/.lpr) for accurate cross-file references.
+        # pasls uses this as the start unit for its uses graph in textDocument/references.
+        program_path = ""
+        # Prefer LS-specific settings (persistent config) over env var.
+        # Example serena_config.yml:
+        #   ls_specific_settings:
+        #     pascal:
+        #       program: "Profile/Client/ProfileXE104.dpr"
+        cfg_program = str(self._custom_settings.get("program", "")).strip()
+        # Allow env var to override project/global config for ad-hoc experiments and debugging.
+        env_program = os.environ.get(_PASCAL_PROGRAM_ENV_VAR, "").strip()
+        program_spec = env_program or cfg_program
+        if program_spec:
+            # Allow either absolute or repo-relative path
+            candidate = program_spec
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(repository_absolute_path, candidate)
+            candidate = os.path.abspath(candidate)
+            if os.path.isfile(candidate):
+                program_path = candidate
+                log.info(f"Using Pascal program root: {program_path}")
+            else:
+                log.warning(
+                    f"Pascal program root is set but file not found: {candidate}. "
+                    "pasls references may be incomplete; set it to a valid .dpr/.lpr."
+                )
+
         initialize_params: dict[str, Any] = {
             "locale": "en",
             "initializationOptions": {
                 # Inject the discovered paths as Free Pascal Compiler options
                 "fpcOptions": fpc_options,
                 # Ensure the LS knows we want it to parse the program
-                "program": "",
+                "program": program_path,
                 # Enable SQLite symbol database for production performance
                 "symbolDatabase": symbol_db_path,
                 # Workspace symbol support is a major performance lever for global symbol search.

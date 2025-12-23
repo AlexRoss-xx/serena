@@ -792,7 +792,6 @@ class LanguageServerSymbolRetriever:
                         "-I",
                         "--fixed-strings",
                         "--no-color",
-                        "--no-messages",
                         "--",
                         query,
                         scope_rel,
@@ -801,6 +800,8 @@ class LanguageServerSymbolRetriever:
                     check=False,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
             except Exception:
                 proc = None
@@ -1021,11 +1022,28 @@ class LanguageServerSymbolRetriever:
         assert symbol_location.line is not None
         assert symbol_location.column is not None
         lang_server = self.get_language_server(symbol_location.relative_path)
+        # Pascal-specific robustness:
+        # Some pasls builds return document symbols where `selectionRange.start.character` points to the beginning
+        # of the line (often whitespace or a keyword) instead of the identifier token. pasls' references logic
+        # expects the cursor position to be *inside* the identifier; otherwise it may return 0 refs.
+        ref_line = symbol_location.line
+        ref_col = symbol_location.column
+        if getattr(lang_server, "language", None) == Language.PASCAL and referenced_symbol_name:
+            try:
+                ref_line, ref_col = self._adjust_pascal_reference_position(
+                    relative_file_path=symbol_location.relative_path,
+                    line=ref_line,
+                    col=ref_col,
+                    identifier=referenced_symbol_name,
+                )
+            except Exception:
+                # best-effort: never fail the call due to adjustment
+                pass
         try:
             references = lang_server.request_referencing_symbols(
                 relative_file_path=symbol_location.relative_path,
-                line=symbol_location.line,
-                column=symbol_location.column,
+                line=ref_line,
+                column=ref_col,
                 include_imports=False,
                 include_self=False,
                 include_body=include_body,
@@ -1052,6 +1070,35 @@ class LanguageServerSymbolRetriever:
             references = [s for s in references if s.symbol["kind"] not in exclude_kinds]
 
         return [ReferenceInLanguageServerSymbol.from_lsp_reference(r) for r in references]
+
+    def _adjust_pascal_reference_position(self, *, relative_file_path: str, line: int, col: int, identifier: str) -> tuple[int, int]:
+        """
+        Adjust (line, col) so it points inside the identifier token (pasls requirement for references).
+
+        Reads only a small window of lines near the given line and finds the first word-boundary match,
+        case-insensitive (Pascal identifiers).
+        """
+        max_lines_ahead = 5
+        max_line_length = 5000
+
+        ident = (identifier or "").strip()
+        if not ident:
+            return line, col
+        pattern = re.compile(rf"(?i)(?<![A-Za-z0-9_]){re.escape(ident)}(?![A-Za-z0-9_])")
+
+        abs_path = os.path.join(self.get_root_path(), relative_file_path)
+        with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, text_line in enumerate(f):
+                if i < line:
+                    continue
+                if i > line + max_lines_ahead:
+                    break
+                if len(text_line) > max_line_length:
+                    text_line = text_line[:max_line_length]
+                m = pattern.search(text_line)
+                if m:
+                    return i, m.start()
+        return line, col
 
     def _fallback_references_text_search(
         self,

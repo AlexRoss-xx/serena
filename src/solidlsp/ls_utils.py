@@ -124,6 +124,11 @@ class PathUtils:
 
         This method was obtained from https://stackoverflow.com/a/61922504
         """
+        # Some language servers may emit non-standard Windows file URIs like:
+        #   file:///D:\path\to\file.pas
+        # Normalize backslashes to forward slashes before parsing.
+        if uri and uri.startswith("file:///") and "\\" in uri:
+            uri = uri.replace("\\", "/")
         try:
             from urllib.parse import unquote, urlparse
             from urllib.request import url2pathname

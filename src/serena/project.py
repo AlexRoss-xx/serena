@@ -12,7 +12,7 @@ from serena.constants import SERENA_FILE_ENCODING, SERENA_MANAGED_DIR_NAME
 from serena.ls_manager import LanguageServerFactory, LanguageServerManager
 from serena.text_utils import MatchedConsecutiveLines, search_files
 from serena.util.file_system import GitignoreParser, match_path, to_long_path
-from serena.util.general import save_yaml
+from serena.util.general import load_yaml, save_yaml
 from solidlsp import SolidLanguageServer
 from solidlsp.ls_config import Language
 from solidlsp.ls_utils import FileUtils
@@ -388,6 +388,34 @@ class Project(ToStringMixin):
             self.language_server_manager.stop_all()
             self.language_server_manager = None
 
+        # Per-project LS overrides: `.serena/serena_config.yml`
+        # This allows project-specific LS settings (e.g. pasls `program`) without touching user-global config.
+        merged_ls_specific_settings: dict[Language, Any] = dict(ls_specific_settings or {})
+        try:
+            local_cfg_path = Path(self.project_root) / ".serena" / "serena_config.yml"
+            if local_cfg_path.is_file():
+                local_cfg = load_yaml(str(local_cfg_path), preserve_comments=False) or {}
+                local_ls = local_cfg.get("ls_specific_settings", {}) if isinstance(local_cfg, dict) else {}
+                if isinstance(local_ls, dict):
+                    if local_ls:
+                        log.info("Loaded project-local LS overrides from %s", local_cfg_path)
+                    for lang_key, lang_settings in local_ls.items():
+                        try:
+                            lang_enum = Language(str(lang_key))
+                        except Exception:
+                            log.warning("Ignoring unknown language key in %s: %s", local_cfg_path, lang_key)
+                            continue
+                        if not isinstance(lang_settings, dict):
+                            log.warning(
+                                "Ignoring non-dict ls_specific_settings for %s in %s", lang_key, local_cfg_path
+                            )
+                            continue
+                        base = dict(merged_ls_specific_settings.get(lang_enum, {}) or {})
+                        base.update(lang_settings)  # project-local wins
+                        merged_ls_specific_settings[lang_enum] = base
+        except Exception as e:
+            log.warning("Failed to load per-project `.serena/serena_config.yml`: %s", e)
+
         log.info(f"Creating language server manager for {self.project_root}")
         factory = LanguageServerFactory(
             project_root=self.project_root,
@@ -395,7 +423,7 @@ class Project(ToStringMixin):
             ignored_patterns=self._ignored_patterns,
             ls_timeout=ls_timeout,
             ls_startup_timeout=ls_startup_timeout,
-            ls_specific_settings=ls_specific_settings,
+            ls_specific_settings=merged_ls_specific_settings,
             trace_lsp_communication=trace_lsp_communication,
         )
         self.language_server_manager = LanguageServerManager.from_languages(self.project_config.languages, factory)

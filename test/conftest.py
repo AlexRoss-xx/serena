@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -190,9 +191,51 @@ def _determine_disabled_languages() -> list[Language]:
     """
     result: list[Language] = []
 
+    downloads_enabled = os.environ.get("SERENA_TEST_ENABLE_DOWNLOADS", "").strip() == "1"
+    enable_kotlin = os.environ.get("SERENA_TEST_ENABLE_KOTLIN", "").strip() == "1"
+    enable_rust = os.environ.get("SERENA_TEST_ENABLE_RUST", "").strip() == "1"
+
+    def _is_go_enabled() -> bool:
+        # Go LS requires gopls on PATH (no auto-download).
+        return shutil.which("gopls") is not None
+
+    def _is_rust_enabled() -> bool:
+        # Rust LS can auto-download rust-analyzer, but only when downloads are allowed.
+        # Otherwise require rustup or rust-analyzer to exist locally.
+        if enable_rust:
+            return True
+        return downloads_enabled or (shutil.which("rustup") is not None) or (shutil.which("rust-analyzer") is not None)
+
+    def _is_kotlin_enabled() -> bool:
+        # Kotlin LS auto-downloads a server + bundled JRE, and may still be flaky on some Windows setups.
+        # We keep it opt-in by default: set SERENA_TEST_ENABLE_KOTLIN=1 to enable.
+        if not enable_kotlin:
+            return False
+        if downloads_enabled:
+            return True
+        try:
+            settings = SolidLSPSettings(solidlsp_dir=SerenaPaths().serena_user_home_dir, project_data_relative_path=SERENA_MANAGED_DIR_NAME)
+            base = Path(settings.ls_resources_dir) / "KotlinLanguageServer" / "kotlin_language_server"
+            script = base / ("kotlin-lsp.cmd" if os.name == "nt" else "kotlin-lsp.sh")
+            return script.exists()
+        except Exception:
+            return False
+
     java_tests_enabled = True
     if not java_tests_enabled:
         result.append(Language.JAVA)
+
+    go_tests_enabled = _is_go_enabled()
+    if not go_tests_enabled:
+        result.append(Language.GO)
+
+    rust_tests_enabled = _is_rust_enabled()
+    if not rust_tests_enabled:
+        result.append(Language.RUST)
+
+    kotlin_tests_enabled = _is_kotlin_enabled()
+    if not kotlin_tests_enabled:
+        result.append(Language.KOTLIN)
 
     clojure_tests_enabled = is_clojure_cli_available()
     if not clojure_tests_enabled:

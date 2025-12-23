@@ -3,6 +3,8 @@ Language server-related tools
 """
 
 import os
+import shutil
+import subprocess
 from collections.abc import Sequence
 from copy import copy
 from typing import Any
@@ -162,6 +164,194 @@ class FindSymbolTool(Tool, ToolMarkerSymbolicRead):
         symbol_dicts = [_sanitize_symbol_dict(s.to_dict(kind=True, location=True, depth=depth, include_body=include_body)) for s in symbols]
         result = self._to_json(symbol_dicts)
         return self._limit_length(result, max_answer_chars)
+
+
+class FindIdentifierFastTool(Tool, ToolMarkerSymbolicRead):
+    """
+    Fast identifier search using ripgrep (rg) with a bounded candidate set.
+
+    This is intended for cases where LSP-backed `find_symbol` is slow or unreliable
+    (common for Pascal `const` identifiers like CID_*), and you just need a fast,
+    correct "where does this identifier appear" answer.
+    """
+
+    def apply(
+        self,
+        identifier: str,
+        relative_path: str = "",
+        case_insensitive: bool = True,
+        max_files: int = 50,
+        max_matches_per_file: int = 20,
+        include_globs: str = "*.{pas,pp,inc,dpr,lpr,dpk}",
+        max_answer_chars: int = -1,
+    ) -> str:
+        """
+        :param identifier: identifier string to search (literal match; no regex)
+        :param relative_path: optional file/dir scope relative to project root
+        :param case_insensitive: whether to match case-insensitively (recommended for Pascal)
+        :param max_files: maximum number of files to scan/report (bounded for speed)
+        :param max_matches_per_file: maximum matches per file (bounded for speed)
+        :param include_globs: comma/brace-glob string passed to rg as --glob; default targets Pascal/Delphi sources
+        :param max_answer_chars: max characters for JSON result (Serena output limiter)
+        :return: JSON object containing candidate files and matches (file, line, column, text)
+        """
+        identifier = (identifier or "").strip()
+        if not identifier:
+            raise ValueError("identifier must be non-empty")
+
+        root = self.get_project_root()
+        scope_rel = relative_path.strip() if relative_path else "."
+        scope_abs = os.path.join(root, scope_rel) if scope_rel else root
+        if not os.path.exists(scope_abs):
+            raise FileNotFoundError(f"Relative path {relative_path} does not exist.")
+
+        max_files = max(1, int(max_files))
+        max_matches_per_file = max(1, int(max_matches_per_file))
+
+        # Prefer ripgrep.
+        rg = shutil.which("rg")
+        matches: list[dict[str, Any]] = []
+        candidate_files: list[str] = []
+
+        def _parse_rg_lines(text: str) -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            for line in (text or "").splitlines():
+                # format: path:line:col:text
+                parts = line.split(":", 3)
+                if len(parts) != 4:
+                    continue
+                rel, ln, col, content = parts
+                try:
+                    out.append(
+                        {
+                            "relative_path": rel,
+                            "line": int(ln),  # 1-based (rg)
+                            "column": int(col),  # 1-based (rg)
+                            "text": content,
+                        }
+                    )
+                except Exception:
+                    continue
+            return out
+
+        def _normalize_paths(lines: list[str]) -> list[str]:
+            out: list[str] = []
+            for ln in lines:
+                p = (ln or "").strip()
+                if not p:
+                    continue
+                # rg returns paths relative to cwd if invoked with cwd=root
+                out.append(p)
+                if len(out) >= max_files:
+                    break
+            return out
+
+        # Build globs: allow "a,b,c" and "{a,b,c}" style.
+        globs: list[str] = []
+        for g in (include_globs or "").split(","):
+            g = g.strip()
+            if g:
+                globs.append(g)
+
+        if rg:
+            # 1) Get candidate files quickly.
+            cmd_files = [
+                rg,
+                "--files-with-matches",
+                "--fixed-strings",
+                "--no-messages",
+                "--hidden",
+                "--follow",
+            ]
+            if case_insensitive:
+                cmd_files.append("--ignore-case")
+            for g in globs:
+                cmd_files.extend(["--glob", g])
+            cmd_files.extend([identifier, scope_rel])
+            proc_files = subprocess.run(
+                cmd_files, cwd=root, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace"
+            )
+            if proc_files.returncode in (0, 1):
+                candidate_files = _normalize_paths(proc_files.stdout.splitlines())
+
+            # 2) Collect line matches from those candidates (bounded).
+            if candidate_files:
+                cmd_hits = [
+                    rg,
+                    "--no-heading",
+                    "--line-number",
+                    "--column",
+                    "--fixed-strings",
+                    "--no-messages",
+                    "--hidden",
+                    "--follow",
+                    f"--max-count={max_matches_per_file}",
+                ]
+                if case_insensitive:
+                    cmd_hits.append("--ignore-case")
+                cmd_hits.append(identifier)
+                cmd_hits.extend(candidate_files)
+                proc_hits = subprocess.run(
+                    cmd_hits, cwd=root, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace"
+                )
+                if proc_hits.returncode in (0, 1):
+                    matches = _parse_rg_lines(proc_hits.stdout)
+
+        # 2) Fallback: git grep (tracked files only).
+        if not candidate_files:
+            git = shutil.which("git")
+            if git:
+                cmd = [
+                    git,
+                    "-C",
+                    root,
+                    "grep",
+                    "-n",
+                    "-I",
+                    "--fixed-strings",
+                    "--no-color",
+                    "--",
+                    identifier,
+                    scope_rel,
+                ]
+                proc = subprocess.run(cmd, cwd=root, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if proc.returncode in (0, 1):
+                    # format: path:line:text
+                    for ln in (proc.stdout or "").splitlines():
+                        parts = ln.split(":", 2)
+                        if len(parts) != 3:
+                            continue
+                        rel, line_no, content = parts
+                        # quick glob filter (extensions) since git grep doesn't filter by glob portably
+                        if globs:
+                            # best-effort: only apply extension filter for the default Pascal globs
+                            _, ext = os.path.splitext(rel.lower())
+                            if ext not in {".pas", ".pp", ".inc", ".dpr", ".lpr", ".dpk"}:
+                                continue
+                        try:
+                            matches.append({"relative_path": rel, "line": int(line_no), "column": None, "text": content})
+                        except Exception:
+                            continue
+                        if len(matches) >= (max_files * max_matches_per_file):
+                            break
+                    # derive candidates from matches
+                    seen: set[str] = set()
+                    for m in matches:
+                        rp = m["relative_path"]
+                        if rp not in seen:
+                            seen.add(rp)
+                            candidate_files.append(rp)
+                            if len(candidate_files) >= max_files:
+                                break
+
+        result_obj = {
+            "identifier": identifier,
+            "scope": relative_path or "",
+            "case_insensitive": case_insensitive,
+            "candidate_files": candidate_files,
+            "matches": matches,
+        }
+        return self._limit_length(self._to_json(result_obj), max_answer_chars)
 
 
 class FindReferencingSymbolsTool(Tool, ToolMarkerSymbolicRead):

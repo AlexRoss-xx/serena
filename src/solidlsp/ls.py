@@ -669,7 +669,8 @@ class SolidLanguageServer(ABC):
                 DefinitionParams,
                 {
                     LSPConstants.TEXT_DOCUMENT: {
-                        LSPConstants.URI: pathlib.Path(str(PurePath(self.repository_root_path, relative_file_path))).as_uri()
+                        # Use the language-server specific URI encoding (important on Windows for pasls).
+                        LSPConstants.URI: self._path_to_uri(os.path.join(self.repository_root_path, relative_file_path))
                     },
                     LSPConstants.POSITION: {
                         LSPConstants.LINE: line,
@@ -718,13 +719,25 @@ class SolidLanguageServer(ABC):
 
         return ret
 
+    def _references_include_declaration(self) -> bool:
+        """
+        Whether LSP reference results should include the declaration location.
+
+        Default is False. Pascal can opt-in via env var to help diagnose missing refs.
+        Kept as a separate method so subclasses can override without signature mismatch.
+        """
+        if self.language == Language.PASCAL:
+            return os.environ.get("SERENA_PASCAL_REFERENCES_INCLUDE_DECLARATION", "").strip() in {"1", "true", "True"}
+        return False
+
     # Some LS cause problems with this, so the call is isolated from the rest to allow overriding in subclasses
     def _send_references_request(self, relative_file_path: str, line: int, column: int) -> list[lsp_types.Location] | None:
         return self.server.send.references(
             {
-                "textDocument": {"uri": PathUtils.path_to_uri(os.path.join(self.repository_root_path, relative_file_path))},
+                # Use _path_to_uri (subclass-overridable). Pascal needs a non-standard Windows URI form (`file://D:/...`).
+                "textDocument": {"uri": self._path_to_uri(os.path.join(self.repository_root_path, relative_file_path))},
                 "position": {"line": line, "character": column},
-                "context": {"includeDeclaration": False},
+                "context": {"includeDeclaration": self._references_include_declaration()},
             }
         )
 
