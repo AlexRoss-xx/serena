@@ -31,7 +31,7 @@ fpc/3.3.1/
 ├── source/             (281 MB)  - FPC source (required by CodeTools)
 └── units/i386-win32/   (~50 MB)  - Only RTL/FCL packages needed
 ```
-
+https://drive.google.com/embeddedfolderview?id=0B3iIrj8df2EtOVBIQi1ZOGpSdVk&resourcekey=0-xApPRycoHouNaf4JUXUc8w#list
 **Total Distribution Size:** ~420 MB (trimmed) or ~1.1 GB (full)
 
 ---
@@ -263,9 +263,7 @@ Remove-Item "D:\profile\.serena\cache\pascal\*" -Recurse
 
 ## 📞 Support
 
-**For Pascal Language Server Issues:**
-- Repository: https://github.com/genericptr/pascal-language-server
-- Issues: File with `[FPC 3.3.1]` tag
+ 
 
 **For Serena Integration Issues:**
 - Check logs: `C:\Users\<username>\.serena\logs\`
