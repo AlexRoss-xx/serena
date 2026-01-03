@@ -224,7 +224,25 @@ class CSharpLanguageServer(SolidLanguageServer):
 
         log.debug(f"Language server command: {' '.join(cmd)}")
 
-        super().__init__(config, repository_root_path, ProcessLaunchInfo(cmd=cmd, cwd=repository_root_path), "csharp", solidlsp_settings)
+        # Set environment variables for MSBuild build host process
+        # These may help with timeout issues on large projects
+        env = os.environ.copy()
+        # Increase timeout for named pipe connections (in milliseconds, default is typically 30000)
+        # Note: This is a workaround - the actual timeout is controlled by MSBuild internally
+        # Setting DOTNET_SYSTEM_NET_HTTP_SOCKETSHTTPHANDLER_HTTP2FLOWCONTROL_DISABLEDINITIALWINDOWSIZE
+        # and other MSBuild-related env vars might help, but the named pipe timeout is hardcoded
+        # The main solution is to ensure MSBuild can start quickly and projects load efficiently
+        
+        super().__init__(config, repository_root_path, ProcessLaunchInfo(cmd=cmd, cwd=repository_root_path, env=env), "csharp", solidlsp_settings)
+
+        # Set generous timeout for C# on large projects
+        # MSBuild build host process connection and project loading can take time on large solutions
+        # The timeout error occurs when connecting to the build host via named pipes
+        # Note: The named pipe connection timeout (typically 30s) is controlled by MSBuild internally
+        # and cannot be directly configured. This LSP timeout gives more time for the overall operation,
+        # but individual project loads may still timeout if the build host is slow to start.
+        # For very large solutions, consider loading projects incrementally or splitting the solution.
+        self.set_request_timeout(1200.0)  # 20 minutes for initialization and individual LSP requests (increased from 600s)
 
         self.initialization_complete = threading.Event()
 
@@ -532,7 +550,19 @@ class CSharpLanguageServer(SolidLanguageServer):
             # Map LSP message types to Python logging levels
             level_map = {1: logging.ERROR, 2: logging.WARNING, 3: logging.INFO, 4: logging.DEBUG}  # Error  # Warning  # Info  # Log
 
-            log.log(level_map.get(level, logging.DEBUG), f"LSP: {message_text}")
+            # Provide helpful context for MSBuild build host timeout errors
+            if "TimeoutException" in message_text and "NamedPipeClientStream.ConnectInternal" in message_text:
+                log.warning(
+                    f"LSP: {message_text}\n"
+                    "Note: This timeout occurs when connecting to the MSBuild build host process. "
+                    "The language server will continue loading other projects. "
+                    "If this project is critical, try: "
+                    "1) Restore NuGet packages (dotnet restore), "
+                    "2) Check project file validity, "
+                    "3) Ensure .NET SDK (not just runtime) is installed."
+                )
+            else:
+                log.log(level_map.get(level, logging.DEBUG), f"LSP: {message_text}")
 
         def handle_progress(params: dict) -> None:
             """Handle progress notifications from the language server."""
