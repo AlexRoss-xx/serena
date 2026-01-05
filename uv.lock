@@ -1921,6 +1921,7 @@ version = "0.1.4"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "charset-normalizer" },
     { name = "docstring-parser" },
     { name = "dotenv" },
     { name = "flask" },
@@ -1976,6 +1977,7 @@ requires-dist = [
     { name = "agno", marker = "extra == 'agno'", specifier = ">=2.2.1" },
     { name = "anthropic", specifier = ">=0.54.0" },
     { name = "black", extras = ["jupyter"], marker = "extra == 'dev'", specifier = ">=23.7.0" },
+    { name = "charset-normalizer", specifier = ">=3.0.0,<4" },
     { name = "docstring-parser", specifier = ">=0.16" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "flask", specifier = ">=3.0.0" },
